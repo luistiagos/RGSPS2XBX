@@ -145,3 +145,8 @@ CMakeSettings.json
 /findstr_CLI.bat
 /findstr_CLI(1).bat
 !/pcsx2-uwp/pcsx2-uwp_TemporaryKey.pfx
+
+# Proprietary BIOS / ROM files
+*.bin
+**/Assets/bios/
+**/resources/bios/

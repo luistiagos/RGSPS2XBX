@@ -173,6 +173,7 @@ namespace EmuFolders
 	std::string Textures;
 	std::string InputProfiles;
 	std::string Videos;
+	std::string Roms;
 
 	static bool ShouldUsePortableMode();
 	static std::string GetPortableModePath();
@@ -2310,6 +2311,7 @@ void EmuFolders::SetDefaults(SettingsInterface& si)
 	si.SetStringValue("Folders", "Videos", "videos");
 	si.SetStringValue("Folders", "DebuggerLayouts", "debuggerlayouts");
 	si.SetStringValue("Folders", "DebuggerSettings", "debuggersettings");
+	si.SetStringValue("Folders", "Roms", "roms");
 }
 
 static std::string LoadPathFromSettings(SettingsInterface& si, const std::string& root, const char* name, const char* def)
@@ -2338,6 +2340,7 @@ void EmuFolders::LoadConfig(SettingsInterface& si)
 	Videos = LoadPathFromSettings(si, DataRoot, "Videos", "videos");
 	DebuggerLayouts = LoadPathFromSettings(si, Settings, "DebuggerLayouts", "debuggerlayouts");
 	DebuggerSettings = LoadPathFromSettings(si, Settings, "DebuggerSettings", "debuggersettings");
+	Roms = LoadPathFromSettings(si, DataRoot, "Roms", "roms");
 
 	Console.WriteLn("BIOS Directory: %s", Bios.c_str());
 	Console.WriteLn("Snapshots Directory: %s", Snapshots.c_str());
@@ -2356,6 +2359,7 @@ void EmuFolders::LoadConfig(SettingsInterface& si)
 	Console.WriteLn("Video Dumping Directory: %s", Videos.c_str());
 	Console.WriteLn("Debugger Layouts Directory: %s", DebuggerLayouts.c_str());
 	Console.WriteLn("Debugger Settings Directory: %s", DebuggerSettings.c_str());
+	Console.WriteLn("ROMs Directory: %s", Roms.c_str());
 }
 
 bool EmuFolders::EnsureFoldersExist()
@@ -2377,6 +2381,7 @@ bool EmuFolders::EnsureFoldersExist()
 	result = FileSystem::CreateDirectoryPath(Videos.c_str(), false) && result;
 	result = FileSystem::CreateDirectoryPath(DebuggerLayouts.c_str(), false) && result;
 	result = FileSystem::CreateDirectoryPath(DebuggerSettings.c_str(), false) && result;
+	result = FileSystem::CreateDirectoryPath(Roms.c_str(), false) && result;
 	return result;
 }
 

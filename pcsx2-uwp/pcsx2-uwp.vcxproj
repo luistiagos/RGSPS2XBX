@@ -171,6 +171,9 @@
     <None Include="packages.config" />
     <None Include="pcsx2-uwp_TemporaryKey.pfx" />
     <None Include="PropertySheet.props" />
+    <None Include="Assets\bios\SCPH-90001_BIOS_V18_USA_230.bin" Condition="Exists('Assets\bios\SCPH-90001_BIOS_V18_USA_230.bin')">
+      <DeploymentContent>true</DeploymentContent>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Image Include="Assets\LockScreenLogo.scale-200.png" />

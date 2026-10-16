@@ -13,6 +13,9 @@
     <Filter Include="Assets">
       <UniqueIdentifier>{B2C3D4E5-F6A7-8901-BCDE-F12345678901}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Assets\bios">
+      <UniqueIdentifier>{B2C3D4E5-F6A7-8901-BCDE-F12345678902}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Project References">
       <UniqueIdentifier>{C3D4E5F6-A7B8-9012-CDEF-123456789012}</UniqueIdentifier>
     </Filter>
@@ -54,6 +57,9 @@
     </None>
     <None Include="PropertySheet.props">
       <Filter>Package</Filter>
+    </None>
+    <None Include="Assets\bios\SCPH-90001_BIOS_V18_USA_230.bin">
+      <Filter>Assets\bios</Filter>
     </None>
   </ItemGroup>
   <ItemGroup>

@@ -1470,6 +1470,7 @@ namespace EmuFolders
 	extern std::string Videos;
 	extern std::string DebuggerLayouts;
 	extern std::string DebuggerSettings;
+	extern std::string Roms;
 
 	/// Initializes critical folders (AppRoot, DataRoot, Settings). Call once on startup.
 	void SetAppRoot();
