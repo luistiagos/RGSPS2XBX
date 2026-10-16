@@ -708,6 +708,12 @@
     <ClCompile Include="x86\iCore.cpp">
       <Filter>System\Ps2\iCore</Filter>
     </ClCompile>
+    <ClCompile Include="Catalog.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="RomDownloader.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
     <ClCompile Include="GameDatabase.cpp">
       <Filter>Misc</Filter>
     </ClCompile>
@@ -1667,6 +1673,12 @@
     </ClInclude>
     <ClInclude Include="x86\iCore.h">
       <Filter>System\Ps2\iCore</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="RomDownloader.h">
+      <Filter>Misc</Filter>
     </ClInclude>
     <ClInclude Include="GameDatabase.h">
       <Filter>Misc</Filter>

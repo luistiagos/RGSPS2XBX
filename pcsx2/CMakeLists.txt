@@ -60,6 +60,8 @@ set(pcsx2Sources
 	COP2.cpp
 	Counters.cpp
 	Dmac.cpp
+	Catalog.cpp
+	RomDownloader.cpp
 	GameDatabase.cpp
 	Elfheader.cpp
 	FW.cpp
@@ -148,6 +150,8 @@ set(pcsx2Headers
 	COP0.h
 	Counters.h
 	Dmac.h
+	Catalog.h
+	RomDownloader.h
 	GameDatabase.h
 	Elfheader.h
 	FW.h
