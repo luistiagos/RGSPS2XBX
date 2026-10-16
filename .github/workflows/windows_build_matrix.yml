@@ -93,7 +93,7 @@ jobs:
   build_uwp_release:
     needs: lint_vs_proj_files
     name: "UWP Release"
-    if: github.repository == 'XboxEmulationHub/XBSX2' || github.event_name == 'pull_request'
+    if: github.repository == 'XboxEmulationHub/XBSX2' || github.repository == 'luistiagos/RGSPS2XBX' || github.event_name == 'pull_request'
     uses: ./.github/workflows/windows_build_uwp.yml
     with:
       jobName: "UWP Release"
@@ -105,7 +105,7 @@ jobs:
   build_uwp_avx2:
     needs: lint_vs_proj_files
     name: "UWP AVX2"
-    if: github.repository == 'XboxEmulationHub/XBSX2' || github.event_name == 'pull_request'
+    if: github.repository == 'XboxEmulationHub/XBSX2' || github.repository == 'luistiagos/RGSPS2XBX' || github.event_name == 'pull_request'
     uses: ./.github/workflows/windows_build_uwp.yml
     with:
       jobName: "UWP AVX2"
