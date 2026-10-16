@@ -4,12 +4,12 @@ setlocal enabledelayedexpansion
 echo Setting environment...
 rem Favor VS2022 over VS2026 for now.
 if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
-  for /f "usebackq tokens=*" %%i in (`call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -version "[17, 18)" -latest -property installationPath`) do set "VSINSTPATH=%%i"
+  for /f "usebackq tokens=*" %%i in (`call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -products * -version "[17, 18)" -latest -property installationPath`) do set "VSINSTPATH=%%i"
   if defined VSINSTPATH (
     echo VSINSTPATH=!VSINSTPATH!
     call "!VSINSTPATH!\VC\Auxiliary\Build\vcvarsall.bat" x64 uwp || goto error
   ) else (
-    for /f "usebackq tokens=*" %%i in (`call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -version "[18, 19)" -latest -property installationPath`) do set "VSINSTPATH=%%i"
+    for /f "usebackq tokens=*" %%i in (`call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -products * -version "[18, 19)" -latest -property installationPath`) do set "VSINSTPATH=%%i"
     if defined VSINSTPATH (
       echo VSINSTPATH=!VSINSTPATH!
       call "!VSINSTPATH!\VC\Auxiliary\Build\vcvarsall.bat" x64 uwp || goto error
@@ -28,7 +28,7 @@ if /I "%VSCMD_ARG_APP_PLAT%"=="Desktop" (
   goto error
 )
 
-set SEVENZIP="C:\Program Files\7-Zip\7z.exe"
+set SEVENZIP="C:\Program Files\7-Zip\7z.exe" -snl-
 set PATCH="C:\Program Files\Git\usr\bin\patch.exe"
 set GIT="C:\Program Files\Git\bin\git.exe"
 rem We only expect people to be running this software on Xbox One/Series X|S in Developer mode or on Windows UWP.
@@ -58,7 +58,7 @@ echo SCRIPTDIR=%SCRIPTDIR%
 echo BUILDDIR=%BUILDDIR%
 echo INSTALLDIR=%INSTALLDIR%
 
-set "PATH=%PATH%;%INSTALLDIR%\bin"
+set "PATH=%PATH%;%INSTALLDIR%\bin;C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
 
 cd "%BUILDDIR%"
 
@@ -267,7 +267,7 @@ exit 0
 
 :error
 echo Failed with error #%errorlevel%.
-pause
+rem pause
 exit %errorlevel%
 
 :downloadfile
