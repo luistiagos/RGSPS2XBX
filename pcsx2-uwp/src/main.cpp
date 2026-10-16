@@ -32,10 +32,14 @@
 #include "pcsx2/INISettingsInterface.h"
 #include "pcsx2/MTGS.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/Config.h"
+#include "pcsx2/ps2/BiosTools.h"
 
 #include "pcsx2/ImGui/FullscreenUI.h"
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
 #include "pcsx2/GameList.h"
+#include "pcsx2/Catalog.h"
+#include "pcsx2/RomDownloader.h"
 
 #ifdef ENABLE_ACHIEVEMENTS
 #include "pcsx2/Achievements.h"
@@ -287,6 +291,109 @@ bool WinRTHost::InitializeConfig()
 	}
 
 	VMManager::Internal::LoadStartupSettings();
+
+	// Auto-deploy embedded BIOS on first boot if unconfigured or missing (needs proper testing on real console hardware)
+	static constexpr const char* EMBEDDED_BIOS_FILENAME = "SCPH-90001_BIOS_V18_USA_230.bin";
+
+	std::string configured_bios = s_settings_interface->GetStringValue("Filenames", "BIOS", "");
+	bool needs_bios_deploy = false;
+
+	if (configured_bios.empty())
+	{
+		needs_bios_deploy = true;
+	}
+	else
+	{
+		const std::string full_bios_path = Path::Combine(EmuFolders::Bios, configured_bios);
+		if (!FileSystem::FileExists(full_bios_path.c_str()))
+		{
+			needs_bios_deploy = true;
+		}
+	}
+
+	if (needs_bios_deploy)
+	{
+		// Check if any valid BIOS image already exists in EmuFolders::Bios
+		FileSystem::FindResultsArray bios_files;
+		FileSystem::FindFiles(EmuFolders::Bios.c_str(), "*", FILESYSTEM_FIND_FILES, &bios_files);
+		bool found_existing_bios = false;
+		for (const auto& f : bios_files)
+		{
+			u32 ver, reg;
+			std::string desc, zn;
+			if (IsBIOS(f.FileName.c_str(), ver, desc, reg, zn))
+			{
+				found_existing_bios = true;
+				const std::string bios_leaf(Path::GetFileName(f.FileName));
+				s_settings_interface->SetStringValue("Filenames", "BIOS", bios_leaf.c_str());
+				EmuConfig.BaseFilenames.Bios = bios_leaf;
+				auto lock = Host::GetSettingsLock();
+				s_settings_interface->Save(&error);
+				Console.WriteLnFmt("Configured existing BIOS '{}' found in '{}'", bios_leaf, EmuFolders::Bios);
+				break;
+			}
+		}
+
+		if (!found_existing_bios)
+		{
+			std::string embedded_bios_src;
+			const std::string res_path = Path::Combine(EmuFolders::Resources, "bios" FS_OSPATH_SEPARATOR_STR "SCPH-90001_BIOS_V18_USA_230.bin");
+			const std::string assets_path = Path::Combine(EmuFolders::AppRoot, "Assets" FS_OSPATH_SEPARATOR_STR "bios" FS_OSPATH_SEPARATOR_STR "SCPH-90001_BIOS_V18_USA_230.bin");
+			const std::string app_res_path = Path::Combine(EmuFolders::AppRoot, "resources" FS_OSPATH_SEPARATOR_STR "bios" FS_OSPATH_SEPARATOR_STR "SCPH-90001_BIOS_V18_USA_230.bin");
+
+			if (FileSystem::FileExists(res_path.c_str()))
+				embedded_bios_src = res_path;
+			else if (FileSystem::FileExists(assets_path.c_str()))
+				embedded_bios_src = assets_path;
+			else if (FileSystem::FileExists(app_res_path.c_str()))
+				embedded_bios_src = app_res_path;
+
+			const std::string bios_dest = Path::Combine(EmuFolders::Bios, EMBEDDED_BIOS_FILENAME);
+			if (!embedded_bios_src.empty())
+			{
+				if (!FileSystem::FileExists(bios_dest.c_str()))
+				{
+					Console.WriteLnFmt("Auto-deploying embedded BIOS from '{}' to '{}'...", embedded_bios_src, bios_dest);
+					if (FileSystem::CopyFilePath(embedded_bios_src.c_str(), bios_dest.c_str(), true))
+					{
+						Console.WriteLnFmt("Successfully deployed embedded BIOS to '{}'", bios_dest);
+					}
+					else
+					{
+						Console.ErrorFmt("Failed to copy embedded BIOS to '{}'", bios_dest);
+					}
+				}
+
+				if (FileSystem::FileExists(bios_dest.c_str()))
+				{
+					s_settings_interface->SetStringValue("Filenames", "BIOS", EMBEDDED_BIOS_FILENAME);
+					EmuConfig.BaseFilenames.Bios = EMBEDDED_BIOS_FILENAME;
+					auto lock = Host::GetSettingsLock();
+					s_settings_interface->Save(&error);
+					VMManager::Internal::UpdateEmuFolders();
+				}
+			}
+			else
+			{
+				Console.WarningFmt("Embedded BIOS '{}' not found in package resources.", EMBEDDED_BIOS_FILENAME);
+			}
+		}
+	}
+
+	// Ensure default ROMs directory exists and is registered in GameList scan paths
+	FileSystem::EnsureDirectoryExists(EmuFolders::Roms.c_str(), false);
+	const std::vector<std::string> search_dirs = s_settings_interface->GetStringList("GameList", "RecursivePaths");
+	if (std::find(search_dirs.begin(), search_dirs.end(), EmuFolders::Roms) == search_dirs.end())
+	{
+		s_settings_interface->AddToStringList("GameList", "RecursivePaths", EmuFolders::Roms.c_str());
+		auto lock = Host::GetSettingsLock();
+		s_settings_interface->Save(&error);
+	}
+
+	// Initialize background catalog manager and scan local ROMs (needs proper testing on console storage)
+	Catalog::Manager::GetInstance().Initialize();
+	RomDownloader::Manager::GetInstance().Initialize();
+
 	return true;
 }
 
@@ -908,6 +1015,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView>
 
 	void Uninitialize()
 	{
+		Catalog::Manager::GetInstance().Shutdown();
 	}
 
 	static void EmuThread()
@@ -1005,6 +1113,9 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView>
 
 		if (m_emu_thread.joinable())
 			m_emu_thread.join();
+
+		RomDownloader::Manager::GetInstance().Shutdown();
+		Catalog::Manager::GetInstance().Shutdown();
 
 		if (!m_launchOnExit.empty())
 		{

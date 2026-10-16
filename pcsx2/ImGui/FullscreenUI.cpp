@@ -32,6 +32,9 @@
 #include "common/SmallString.h"
 #include "common/StringUtil.h"
 #include "common/Threading.h"
+#include "common/HTTPDownloader.h"
+#include "pcsx2/RomDownloader.h"
+#include <unordered_set>
 
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Pad/Pad.h"
@@ -435,6 +438,8 @@ void FullscreenUI::CheckForConfigChanges(const Pcsx2Config& old_config)
 
 void FullscreenUI::OnVMStarted()
 {
+	RomDownloader::Manager::GetInstance().OnVMStarting();
+
 #if defined(WINRT_XBOX)
 	MTGS::RunOnGSThread([]() {
 		s_current_main_window = MainWindowType::None;
@@ -456,6 +461,8 @@ void FullscreenUI::OnVMStarted()
 
 void FullscreenUI::OnVMDestroyed()
 {
+	RomDownloader::Manager::GetInstance().OnVMDestroyed();
+
 	if (!IsInitialized())
 		return;
 
@@ -819,10 +826,14 @@ void FullscreenUI::ReturnToMainWindow()
 		return;
 	}
 
-	if (ShouldDefaultToGameList())
-		SwitchToGameList();
+	// Smart startup view: check downloaded count (needs proper testing on console first boot)
+	const size_t downloaded_count = Catalog::Manager::GetInstance().GetDownloadedCount();
+	if (downloaded_count > 0)
+		s_current_main_nav_tab = MainNavTab::Saved;
 	else
-		SwitchToLanding();
+		s_current_main_nav_tab = MainNavTab::Catalog;
+
+	SwitchToGameList();
 }
 
 bool FullscreenUI::LoadResources()
@@ -2659,6 +2670,713 @@ void FullscreenUI::PopulateGameListEntryList()
 		});
 }
 
+GSTexture* FullscreenUI::GetCatalogCover(const Catalog::Group& group)
+{
+	const std::string sanitized_title = Path::SanitizeFileName(group.title);
+	const std::string local_cover_jpg = Path::Combine(EmuFolders::Covers, sanitized_title + ".jpg");
+	const std::string local_cover_png = Path::Combine(EmuFolders::Covers, sanitized_title + ".png");
+
+	if (FileSystem::FileExists(local_cover_jpg.c_str()))
+		return GetCachedTextureAsync(local_cover_jpg.c_str());
+	if (FileSystem::FileExists(local_cover_png.c_str()))
+		return GetCachedTextureAsync(local_cover_png.c_str());
+
+	if (!group.variants.empty())
+	{
+		const std::string variant_stem = Path::SanitizeFileName(Catalog::Parser::StripExtension(group.variants[0].fileName));
+		const std::string variant_cover_jpg = Path::Combine(EmuFolders::Covers, variant_stem + ".jpg");
+		if (FileSystem::FileExists(variant_cover_jpg.c_str()))
+			return GetCachedTextureAsync(variant_cover_jpg.c_str());
+	}
+
+	// Asynchronous lazy-download of cover if not on disk (needs proper testing on console network)
+	if (!group.coverUrl.empty())
+	{
+		static std::unordered_set<std::string> s_requested_covers;
+		static std::mutex s_requested_covers_mutex;
+
+		bool should_request = false;
+		{
+			std::lock_guard<std::mutex> lock(s_requested_covers_mutex);
+			if (s_requested_covers.find(group.groupKey) == s_requested_covers.end())
+			{
+				s_requested_covers.insert(group.groupKey);
+				should_request = true;
+			}
+		}
+
+		if (should_request)
+		{
+			std::thread([url = group.coverUrl, dest = local_cover_jpg]() {
+				std::unique_ptr<HTTPDownloader> downloader(HTTPDownloader::Create(Host::GetHTTPUserAgent()));
+				if (!downloader)
+					return;
+
+				downloader->CreateRequest(url, [dest](s32 status_code, const std::string&, HTTPDownloader::Request::Data data) {
+					if (status_code == HTTPDownloader::HTTP_STATUS_OK && !data.empty())
+					{
+						FileSystem::EnsureDirectoryExists(EmuFolders::Covers.c_str(), false);
+						FileSystem::WriteBinaryFile(dest.c_str(), data.data(), data.size());
+					}
+				});
+				downloader->WaitForAllRequests();
+			}).detach();
+		}
+	}
+
+	return nullptr;
+}
+
+void FullscreenUI::DrawCatalogCover(const Catalog::Group& group, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max)
+{
+	const GSTexture* cover_texture = GetCatalogCover(group);
+	if (cover_texture)
+	{
+		const ImRect image_rect(CenterImage(ImRect(min, max),
+			ImVec2(static_cast<float>(cover_texture->GetWidth()), static_cast<float>(cover_texture->GetHeight()))));
+
+		draw_list->AddImage(reinterpret_cast<ImTextureID>(cover_texture->GetNativeHandle()),
+			image_rect.Min, image_rect.Max);
+	}
+	else
+	{
+		const float min_size = std::min(max.x - min.x, max.y - min.y);
+		const ImVec2 image_square(min_size, min_size);
+		const ImRect image_rect(CenterImage(ImRect(min, max), image_square));
+
+		DrawListSvgTexture(draw_list, GetTextureForGameListEntryType(GameList::EntryType::PS2Disc, image_square, SvgScaling::Fit),
+			image_rect.Min, image_rect.Max);
+	}
+}
+
+void FullscreenUI::DrawCatalogCardBadges(const Catalog::Group& group, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max)
+{
+	const float badge_padding = LayoutScale(6.0f);
+	const float badge_radius = LayoutScale(12.0f);
+	const ImVec2 tr_pos(max.x - badge_padding - badge_radius * 2.0f, min.y + badge_padding);
+	const ImRect badge_rect(tr_pos, tr_pos + ImVec2(badge_radius * 2.0f, badge_radius * 2.0f));
+
+	const auto& primary = group.GetPrimaryEntry();
+	const bool is_downloading = primary.isDownloading || RomDownloader::Manager::GetInstance().IsGameDownloading(primary.fileName);
+	const bool is_paused = primary.isPaused || RomDownloader::Manager::GetInstance().IsGamePaused(primary.fileName);
+
+	if (is_downloading)
+	{
+		// Top right downloading / paused badge
+		if (is_paused)
+		{
+			draw_list->AddCircleFilled(badge_rect.GetCenter(), badge_radius, IM_COL32(230, 162, 20, 240));
+			const char* icon = ICON_FA_PAUSE;
+			const ImVec2 isz = ImGui::CalcTextSize(icon);
+			draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(255, 255, 255, 255), icon);
+		}
+		else
+		{
+			draw_list->AddCircleFilled(badge_rect.GetCenter(), badge_radius, IM_COL32(0, 122, 255, 240));
+			const char* icon = ICON_FA_CLOUD_ARROW_DOWN;
+			const ImVec2 isz = ImGui::CalcTextSize(icon);
+			draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(255, 255, 255, 255), icon);
+		}
+
+		// Progress bar across the bottom of the cover
+		const float bar_height = LayoutScale(8.0f);
+		const ImVec2 bar_bg_min(min.x, max.y - bar_height);
+		const ImVec2 bar_bg_max(max.x, max.y);
+		draw_list->AddRectFilled(bar_bg_min, bar_bg_max, IM_COL32(20, 20, 20, 230), LayoutScale(2.0f));
+
+		const float pct = std::clamp(primary.downloadProgress, 0.0f, 1.0f);
+		const ImVec2 bar_fill_max(min.x + (max.x - min.x) * pct, max.y);
+		draw_list->AddRectFilled(bar_bg_min, bar_fill_max,
+			is_paused ? IM_COL32(230, 162, 20, 240) : IM_COL32(0, 122, 255, 240), LayoutScale(2.0f));
+
+		// Text pill showing percent
+		std::string pct_text = fmt::format("{:.0f}%", pct * 100.0f);
+		ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+		const ImVec2 ptxt_sz = ImGui::CalcTextSize(pct_text.c_str());
+		const ImVec2 ptxt_pos(bar_bg_min.x + ((bar_bg_max.x - bar_bg_min.x) - ptxt_sz.x) * 0.5f,
+			bar_bg_min.y - ptxt_sz.y - LayoutScale(2.0f));
+		draw_list->AddRectFilled(ptxt_pos - LayoutScale(3.0f, 1.0f), ptxt_pos + ptxt_sz + LayoutScale(3.0f, 1.0f),
+			IM_COL32(10, 10, 10, 215), LayoutScale(3.0f));
+		draw_list->AddText(ptxt_pos, IM_COL32(255, 255, 255, 255), pct_text.c_str());
+		ImGui::PopFont();
+	}
+	else if (group.isDownloaded)
+	{
+		draw_list->AddCircleFilled(badge_rect.GetCenter(), badge_radius, IM_COL32(40, 167, 69, 235));
+		const char* icon = ICON_FA_CHECK;
+		const ImVec2 isz = ImGui::CalcTextSize(icon);
+		draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(255, 255, 255, 255), icon);
+	}
+	else
+	{
+		draw_list->AddCircleFilled(badge_rect.GetCenter(), badge_radius, IM_COL32(20, 20, 20, 195));
+		const char* icon = ICON_FA_CLOUD_ARROW_DOWN;
+		const ImVec2 isz = ImGui::CalcTextSize(icon);
+		draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(230, 230, 230, 255), icon);
+	}
+
+	if (group.variants.size() > 1)
+	{
+		std::string vtext = fmt::format("{} vers.", group.variants.size());
+		ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+		const ImVec2 txt_sz = ImGui::CalcTextSize(vtext.c_str());
+		const ImVec2 pill_min(min.x + badge_padding, min.y + badge_padding);
+		const ImVec2 pill_max = pill_min + txt_sz + LayoutScale(8.0f, 4.0f);
+		draw_list->AddRectFilled(pill_min, pill_max, IM_COL32(30, 30, 30, 215), LayoutScale(4.0f));
+		draw_list->AddText(pill_min + LayoutScale(4.0f, 2.0f), IM_COL32(240, 240, 240, 255), vtext.c_str());
+		ImGui::PopFont();
+	}
+}
+
+void FullscreenUI::DrawSavedEntryCover(const Catalog::Entry& entry, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max)
+{
+	const auto* gl_entry = GameList::GetEntryForPath(entry.localPath.c_str());
+	const GSTexture* cover_texture = gl_entry ? GetGameListCover(gl_entry) : nullptr;
+
+	if (!cover_texture)
+	{
+		const std::string sanitized_title = Path::SanitizeFileName(entry.title);
+		const std::string local_cover_jpg = Path::Combine(EmuFolders::Covers, sanitized_title + ".jpg");
+		if (FileSystem::FileExists(local_cover_jpg.c_str()))
+			cover_texture = GetCachedTextureAsync(local_cover_jpg.c_str());
+	}
+
+	if (cover_texture)
+	{
+		const ImRect image_rect(CenterImage(ImRect(min, max),
+			ImVec2(static_cast<float>(cover_texture->GetWidth()), static_cast<float>(cover_texture->GetHeight()))));
+
+		draw_list->AddImage(reinterpret_cast<ImTextureID>(cover_texture->GetNativeHandle()),
+			image_rect.Min, image_rect.Max);
+	}
+	else
+	{
+		const float min_size = std::min(max.x - min.x, max.y - min.y);
+		const ImVec2 image_square(min_size, min_size);
+		const ImRect image_rect(CenterImage(ImRect(min, max), image_square));
+
+		DrawListSvgTexture(draw_list, GetTextureForGameListEntryType(GameList::EntryType::PS2Disc, image_square, SvgScaling::Fit),
+			image_rect.Min, image_rect.Max);
+	}
+}
+
+void FullscreenUI::DrawSavedEntryBadges(const Catalog::Entry&, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max)
+{
+	const float badge_padding = LayoutScale(6.0f);
+	const float badge_radius = LayoutScale(12.0f);
+	const ImVec2 tr_pos(max.x - badge_padding - badge_radius * 2.0f, min.y + badge_padding);
+	const ImRect badge_rect(tr_pos, tr_pos + ImVec2(badge_radius * 2.0f, badge_radius * 2.0f));
+
+	draw_list->AddCircleFilled(badge_rect.GetCenter(), badge_radius, IM_COL32(40, 167, 69, 235));
+	const char* icon = ICON_FA_PLAY;
+	const ImVec2 isz = ImGui::CalcTextSize(icon);
+	draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(255, 255, 255, 255), icon);
+}
+
+void FullscreenUI::HandleCatalogEntryActivate(size_t group_index)
+{
+	const Catalog::Group* group = Catalog::Manager::GetInstance().GetGroup(group_index);
+	if (!group)
+		return;
+
+	auto handle_variant_action = [](const Catalog::Entry& variant) {
+		const bool is_dl = RomDownloader::Manager::GetInstance().IsGameDownloading(variant.fileName);
+		const bool is_p = RomDownloader::Manager::GetInstance().IsGamePaused(variant.fileName);
+
+		if (is_dl)
+		{
+			RomDownloader::Job job_info;
+			std::string status_txt = is_p ? "Pausado" : "Baixando...";
+			if (RomDownloader::Manager::GetInstance().GetJob(variant.fileName, &job_info))
+				status_txt = job_info.statusMessage;
+
+			ImGuiFullscreen::ChoiceDialogOptions dl_opts;
+			if (is_p)
+				dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PLAY, "Retomar Download"), false);
+			else
+				dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PAUSE, "Pausar Download"), false);
+
+			dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_XMARK, "Cancelar Download"), false);
+			dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Fechar"), false);
+
+			OpenChoiceDialog(variant.fileName.c_str(), false, std::move(dl_opts),
+				[variant, is_p](s32 idx, const std::string&, bool) {
+					if (idx == 0)
+					{
+						if (is_p)
+							RomDownloader::Manager::GetInstance().ResumeCurrentDownload();
+						else
+							RomDownloader::Manager::GetInstance().PauseCurrentDownload();
+					}
+					else if (idx == 1)
+					{
+						OpenConfirmMessageDialog(
+							FSUI_ICONSTR(ICON_FA_TRASH_CAN, "Cancelar Download"),
+							fmt::format(FSUI_FSTR("Deseja realmente cancelar o download de '{}'?"), variant.fileName),
+							[variant](bool confirmed) {
+								if (confirmed)
+								{
+									RomDownloader::Manager::GetInstance().CancelDownload(variant.fileName);
+									ShowToast(FSUI_STR("Download"), FSUI_STR("Download cancelado."), 3.0f);
+								}
+							}, false);
+					}
+					CloseChoiceDialog();
+				});
+			return;
+		}
+
+		if (variant.isDownloaded && !variant.localPath.empty())
+		{
+			DoStartPath(variant.localPath);
+		}
+		else
+		{
+			OpenConfirmMessageDialog(
+				FSUI_ICONSTR(ICON_FA_CLOUD_ARROW_DOWN, "Confirmar Download"),
+				fmt::format(FSUI_FSTR("Deseja baixar '{}'?\n\nO jogo será gravado diretamente em disco e adicionado à aba Salvos pronto para jogar."),
+					variant.fileName),
+				[variant](bool confirmed) {
+					if (confirmed)
+					{
+						if (RomDownloader::Manager::GetInstance().EnqueueDownload(variant))
+						{
+							ShowToast(FSUI_STR("Download"), fmt::format(FSUI_FSTR("Download de '{}' adicionado à fila."), variant.fileName), 4.0f);
+						}
+						else
+						{
+							ShowToast(FSUI_STR("Download"), FSUI_STR("O jogo já se encontra na fila de download."), 4.0f);
+						}
+					}
+				}, true);
+		}
+	};
+
+	if (group->variants.size() > 1)
+	{
+		ImGuiFullscreen::ChoiceDialogOptions options;
+		for (size_t i = 0; i < group->variants.size(); ++i)
+		{
+			const auto& v = group->variants[i];
+			const bool is_dl = RomDownloader::Manager::GetInstance().IsGameDownloading(v.fileName);
+			std::string label;
+			if (is_dl)
+				label = fmt::format("{} {} [{}] (Baixando...)", ICON_FA_CLOUD_ARROW_DOWN, v.fileName, v.IsChd() ? "CHD" : "ISO");
+			else if (v.isDownloaded)
+				label = fmt::format("{} {} [{}] (Baixado)", ICON_FA_PLAY, v.fileName, v.IsChd() ? "CHD" : "ISO");
+			else
+				label = fmt::format("{} {} [{}] (Baixar)", ICON_FA_CLOUD_ARROW_DOWN, v.fileName, v.IsChd() ? "CHD" : "ISO");
+			options.emplace_back(std::move(label), false);
+		}
+		options.emplace_back(FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Cancelar"), false);
+
+		OpenChoiceDialog(group->title.c_str(), false, std::move(options),
+			[group_index, handle_variant_action](s32 index, const std::string&, bool) {
+				const Catalog::Group* g = Catalog::Manager::GetInstance().GetGroup(group_index);
+				if (!g || index < 0 || static_cast<size_t>(index) >= g->variants.size())
+					return;
+
+				handle_variant_action(g->variants[index]);
+			});
+	}
+	else
+	{
+		handle_variant_action(group->GetPrimaryEntry());
+	}
+}
+
+void FullscreenUI::HandleSavedEntryActivate(const Catalog::Entry* entry)
+{
+	if (!entry || entry->localPath.empty())
+		return;
+
+	DoStartPath(entry->localPath);
+}
+
+void FullscreenUI::HandleSavedEntryOptions(const Catalog::Entry* entry)
+{
+	if (!entry || entry->localPath.empty())
+		return;
+
+	const std::string entry_path = entry->localPath;
+	const std::string entry_title = entry->title;
+	const std::string entry_filename = entry->fileName;
+
+	ImGuiFullscreen::ChoiceDialogOptions options = {
+		{FSUI_ICONSTR(ICON_FA_PLAY, "Jogar"), false},
+		{FSUI_ICONSTR(ICON_FA_FORWARD_FAST, "Jogar (Fast Boot)"), false},
+		{FSUI_ICONSTR(ICON_FA_COMPACT_DISC, "Jogar (Full Boot)"), false},
+		{FSUI_ICONSTR(ICON_FA_WRENCH, "Configurações do Jogo"), false},
+		{FSUI_ICONSTR(ICON_FA_TRASH_CAN, "Excluir do Console"), false},
+		{FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Fechar Menu"), false},
+	};
+
+	OpenChoiceDialog(entry_title.c_str(), false, std::move(options),
+		[entry_path, entry_title, entry_filename](s32 index, const std::string&, bool) {
+			switch (index)
+			{
+				case 0:
+					DoStartPath(entry_path);
+					break;
+				case 1:
+					DoStartPath(entry_path, std::nullopt, true);
+					break;
+				case 2:
+					DoStartPath(entry_path, std::nullopt, false);
+					break;
+				case 3:
+					SwitchToGameSettings(entry_path);
+					break;
+				case 4:
+				{
+					OpenConfirmMessageDialog(
+						FSUI_ICONSTR(ICON_FA_TRASH_CAN, "Confirmar Exclusão"),
+						fmt::format(FSUI_FSTR("Tem certeza que deseja apagar a ROM de '{}' do armazenamento para liberar espaço?\n\n"
+											  "Seus dados salvos (Memory Card e Save States) serão 100% preservados."),
+							entry_title),
+						[entry_path, entry_filename](bool result) {
+							if (result)
+							{
+								Error error;
+								if (FileSystem::DeleteFilePath(entry_path.c_str(), &error))
+								{
+									Catalog::Manager::GetInstance().MarkDeleted(entry_filename);
+									Catalog::Manager::GetInstance().RescanLocalRoms();
+									GameList::Refresh(false);
+									ShowToast(FSUI_STR("Excluído"), FSUI_STR("Jogo excluído com sucesso do console. Saves preservados."), 4.0f);
+								}
+								else
+								{
+									ShowToast(FSUI_STR("Erro"), fmt::format(FSUI_FSTR("Falha ao excluir arquivo: {}"), error.GetDescription()), 4.0f);
+								}
+							}
+						}, false, ICON_FA_TRASH_CAN " Excluir", ICON_FA_XMARK " Cancelar");
+					break;
+				}
+				default:
+					break;
+			}
+		});
+}
+
+void FullscreenUI::DrawCatalogGrid(const ImVec2& heading_size)
+{
+	ImGuiIO& io = ImGui::GetIO();
+	if (!BeginFullscreenWindow(
+			ImVec2(0.0f, heading_size.y),
+			ImVec2(io.DisplaySize.x, io.DisplaySize.y - heading_size.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)), "catalog_grid",
+			UIBackgroundColor))
+	{
+		EndFullscreenWindow();
+		return;
+	}
+
+	if (!AreAnyDialogsOpen() && WantsToCloseMenu())
+		SwitchToLanding();
+
+	ResetFocusHere();
+	BeginMenuButtons();
+
+	auto& cat_mgr = Catalog::Manager::GetInstance();
+	if (!cat_mgr.IsLoaded())
+	{
+		ImGui::SetCursorPosY(ImGui::GetWindowHeight() * 0.4f);
+		ImGui::PushFont(g_large_font.first, g_large_font.second);
+		const char* loading_txt = FSUI_CSTR("Carregando catálogo de jogos...");
+		const float tw = ImGui::CalcTextSize(loading_txt).x;
+		ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
+		ImGui::TextUnformatted(loading_txt);
+		ImGui::PopFont();
+		EndFullscreenWindow();
+		return;
+	}
+
+	std::vector<size_t> group_indices;
+	if (!s_catalog_search_query.empty())
+	{
+		group_indices = cat_mgr.SearchGroups(s_catalog_search_query);
+	}
+	else
+	{
+		const size_t total = cat_mgr.GetGroupCount();
+		group_indices.resize(total);
+		for (size_t i = 0; i < total; ++i)
+			group_indices[i] = i;
+	}
+
+	if (group_indices.empty())
+	{
+		ImGui::SetCursorPosY(ImGui::GetWindowHeight() * 0.35f);
+		ImGui::PushFont(g_large_font.first, g_large_font.second);
+		const std::string no_results = fmt::format(FSUI_FSTR("Nenhum jogo encontrado para '{}'."), s_catalog_search_query);
+		const float tw = ImGui::CalcTextSize(no_results.c_str()).x;
+		ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
+		ImGui::TextUnformatted(no_results.c_str());
+		ImGui::PopFont();
+
+		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(15.0f));
+		const float btn_w = LayoutScale(220.0f);
+		ImGui::SetCursorPosX((ImGui::GetWindowWidth() - btn_w) * 0.5f);
+		if (ImGui::Button(FSUI_ICONSTR(ICON_FA_XMARK, "Limpar Busca"), ImVec2(btn_w, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))))
+		{
+			s_catalog_search_query.clear();
+		}
+
+		EndFullscreenWindow();
+		return;
+	}
+
+	const ImGuiStyle& style = ImGui::GetStyle();
+	const float title_spacing = LayoutScale(10.0f);
+	const float item_spacing = LayoutScale(20.0f);
+	const float item_width_with_spacing = std::floor(LayoutScale(LAYOUT_SCREEN_WIDTH / 5.0f));
+	const float item_width = item_width_with_spacing - item_spacing;
+	const float image_width = item_width - (style.FramePadding.x * 2.0f);
+	const float image_height = image_width * 1.33f;
+	const ImVec2 image_size(image_width, image_height);
+	const float item_height = (style.FramePadding.y * 2.0f) + image_height + title_spacing + g_medium_font.second;
+	const ImVec2 item_size(item_width, item_height);
+	const u32 grid_count_x = std::floor(ImGui::GetWindowWidth() / item_width_with_spacing);
+	const float start_x =
+		(static_cast<float>(ImGui::GetWindowWidth()) - (item_width_with_spacing * static_cast<float>(grid_count_x))) * 0.5f;
+
+	SmallString draw_title;
+	u32 grid_x = 0;
+
+	for (size_t grp_idx : group_indices)
+	{
+		const Catalog::Group* group = cat_mgr.GetGroup(grp_idx);
+		if (!group)
+			continue;
+
+		ImGuiWindow* window = ImGui::GetCurrentWindow();
+		if (window->SkipItems)
+			continue;
+
+		if (grid_x == grid_count_x)
+		{
+			grid_x = 0;
+			ImGui::SetCursorPosX(start_x);
+			ImGui::SetCursorPosY(ImGui::GetCursorPosY() + item_spacing);
+		}
+		else
+		{
+			ImGui::SameLine(start_x + static_cast<float>(grid_x) * (item_width + item_spacing));
+		}
+
+		const ImGuiID id = window->GetID(group->groupKey.c_str(), group->groupKey.c_str() + group->groupKey.length());
+		const ImVec2 pos(window->DC.CursorPos);
+		ImRect bb(pos, pos + item_size);
+		ImGui::ItemSize(item_size);
+		if (ImGui::ItemAdd(bb, id))
+		{
+			bool held;
+			bool hovered;
+			bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held, 0);
+			if (hovered)
+			{
+				const ImU32 col = ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered, 0.7f);
+				const float t = std::min<float>(std::abs(std::sin(ImGui::GetTime() * 0.75) * 1.1), 1.0f);
+				ImGui::PushStyleColor(ImGuiCol_Border, ImGui::GetColorU32(ImGuiCol_Border, t));
+				ImGuiFullscreen::DrawMenuButtonFrame(bb.Min, bb.Max, col, true, LayoutScale(ImGuiFullscreen::LAYOUT_FRAME_ROUNDING));
+				ImGui::PopStyleColor();
+			}
+
+			bb.Min += style.FramePadding;
+			bb.Max -= style.FramePadding;
+
+			DrawCatalogCover(*group, ImGui::GetWindowDrawList(), bb.Min, bb.Min + image_size);
+			DrawCatalogCardBadges(*group, ImGui::GetWindowDrawList(), bb.Min, bb.Min + image_size);
+
+			const ImRect title_bb(ImVec2(bb.Min.x, bb.Min.y + image_height + title_spacing), bb.Max);
+			const std::string_view full_title(group->title);
+			const std::string_view title = TrimString(g_medium_font, full_title, title_bb.GetWidth());
+			draw_title.clear();
+			fmt::format_to(std::back_inserter(draw_title), "{}{}", title, (title.length() == full_title.length()) ? "" : g_ellipsis);
+			ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+			ImGuiFullscreen::RenderTextClippedWithShadow(
+				title_bb.Min, title_bb.Max, draw_title.c_str(), draw_title.c_str() + draw_title.length(), nullptr, ImVec2(0.5f, 0.0f), &title_bb);
+			ImGui::PopFont();
+
+			if (pressed)
+			{
+				HandleCatalogEntryActivate(grp_idx);
+			}
+
+			grid_x++;
+		}
+	}
+
+	EndFullscreenWindow();
+}
+
+void FullscreenUI::DrawSavedGrid(const ImVec2& heading_size)
+{
+	ImGuiIO& io = ImGui::GetIO();
+	if (!BeginFullscreenWindow(
+			ImVec2(0.0f, heading_size.y),
+			ImVec2(io.DisplaySize.x, io.DisplaySize.y - heading_size.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)), "saved_grid",
+			UIBackgroundColor))
+	{
+		EndFullscreenWindow();
+		return;
+	}
+
+	if (!AreAnyDialogsOpen() && WantsToCloseMenu())
+		SwitchToLanding();
+
+	ResetFocusHere();
+	BeginMenuButtons();
+
+	const std::vector<Catalog::Entry> all_saved = Catalog::Manager::GetInstance().GetDownloadedEntries();
+	std::vector<const Catalog::Entry*> filtered_saved;
+	filtered_saved.reserve(all_saved.size());
+
+	for (const auto& entry : all_saved)
+	{
+		if (s_saved_search_query.empty())
+		{
+			filtered_saved.push_back(&entry);
+		}
+		else
+		{
+			const std::string norm_title = Catalog::Parser::NormalizeSearchText(entry.title);
+			const std::string norm_q = Catalog::Parser::NormalizeSearchText(s_saved_search_query);
+			if (norm_title.find(norm_q) != std::string::npos)
+				filtered_saved.push_back(&entry);
+		}
+	}
+
+	if (filtered_saved.empty())
+	{
+		ImGui::SetCursorPosY(ImGui::GetWindowHeight() * 0.30f);
+		ImGui::PushFont(g_large_font.first, g_large_font.second);
+		const char* msg1 = s_saved_search_query.empty() ?
+			FSUI_CSTR("Nenhum jogo salvo localmente.") :
+			FSUI_CSTR("Nenhum jogo salvo encontrado para esta busca.");
+		const float w1 = ImGui::CalcTextSize(msg1).x;
+		ImGui::SetCursorPosX((ImGui::GetWindowWidth() - w1) * 0.5f);
+		ImGui::TextUnformatted(msg1);
+		ImGui::PopFont();
+
+		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(10.0f));
+		ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+		const char* msg2 = s_saved_search_query.empty() ?
+			FSUI_CSTR("Acesse a aba [ Catálogo ] (pressione LB) para explorar e baixar jogos de PS2 prontos para jogar.") :
+			FSUI_CSTR("Pressione (X) para limpar a busca atual.");
+		const float w2 = ImGui::CalcTextSize(msg2).x;
+		ImGui::SetCursorPosX((ImGui::GetWindowWidth() - w2) * 0.5f);
+		ImGui::TextUnformatted(msg2);
+		ImGui::PopFont();
+
+		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(25.0f));
+		const float btn_w = LayoutScale(250.0f);
+		ImGui::SetCursorPosX((ImGui::GetWindowWidth() - btn_w) * 0.5f);
+		if (s_saved_search_query.empty())
+		{
+			if (ImGui::Button(FSUI_ICONSTR(ICON_FA_BOOK, "Explorar Catálogo"), ImVec2(btn_w, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))))
+			{
+				s_current_main_nav_tab = MainNavTab::Catalog;
+				QueueResetFocus(FocusResetType::WindowChanged);
+			}
+		}
+		else
+		{
+			if (ImGui::Button(FSUI_ICONSTR(ICON_FA_XMARK, "Limpar Busca"), ImVec2(btn_w, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))))
+			{
+				s_saved_search_query.clear();
+			}
+		}
+
+		EndFullscreenWindow();
+		return;
+	}
+
+	const ImGuiStyle& style = ImGui::GetStyle();
+	const float title_spacing = LayoutScale(10.0f);
+	const float item_spacing = LayoutScale(20.0f);
+	const float item_width_with_spacing = std::floor(LayoutScale(LAYOUT_SCREEN_WIDTH / 5.0f));
+	const float item_width = item_width_with_spacing - item_spacing;
+	const float image_width = item_width - (style.FramePadding.x * 2.0f);
+	const float image_height = image_width * 1.33f;
+	const ImVec2 image_size(image_width, image_height);
+	const float item_height = (style.FramePadding.y * 2.0f) + image_height + title_spacing + g_medium_font.second;
+	const ImVec2 item_size(item_width, item_height);
+	const u32 grid_count_x = std::floor(ImGui::GetWindowWidth() / item_width_with_spacing);
+	const float start_x =
+		(static_cast<float>(ImGui::GetWindowWidth()) - (item_width_with_spacing * static_cast<float>(grid_count_x))) * 0.5f;
+
+	SmallString draw_title;
+	u32 grid_x = 0;
+
+	for (const Catalog::Entry* entry : filtered_saved)
+	{
+		ImGuiWindow* window = ImGui::GetCurrentWindow();
+		if (window->SkipItems)
+			continue;
+
+		if (grid_x == grid_count_x)
+		{
+			grid_x = 0;
+			ImGui::SetCursorPosX(start_x);
+			ImGui::SetCursorPosY(ImGui::GetCursorPosY() + item_spacing);
+		}
+		else
+		{
+			ImGui::SameLine(start_x + static_cast<float>(grid_x) * (item_width + item_spacing));
+		}
+
+		const ImGuiID id = window->GetID(entry->localPath.c_str(), entry->localPath.c_str() + entry->localPath.length());
+		const ImVec2 pos(window->DC.CursorPos);
+		ImRect bb(pos, pos + item_size);
+		ImGui::ItemSize(item_size);
+		if (ImGui::ItemAdd(bb, id))
+		{
+			bool held;
+			bool hovered;
+			bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held, 0);
+			if (hovered)
+			{
+				const ImU32 col = ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered, 0.7f);
+				const float t = std::min<float>(std::abs(std::sin(ImGui::GetTime() * 0.75) * 1.1), 1.0f);
+				ImGui::PushStyleColor(ImGuiCol_Border, ImGui::GetColorU32(ImGuiCol_Border, t));
+				ImGuiFullscreen::DrawMenuButtonFrame(bb.Min, bb.Max, col, true, LayoutScale(ImGuiFullscreen::LAYOUT_FRAME_ROUNDING));
+				ImGui::PopStyleColor();
+			}
+
+			bb.Min += style.FramePadding;
+			bb.Max -= style.FramePadding;
+
+			DrawSavedEntryCover(*entry, ImGui::GetWindowDrawList(), bb.Min, bb.Min + image_size);
+			DrawSavedEntryBadges(*entry, ImGui::GetWindowDrawList(), bb.Min, bb.Min + image_size);
+
+			const ImRect title_bb(ImVec2(bb.Min.x, bb.Min.y + image_height + title_spacing), bb.Max);
+			const std::string_view full_title(entry->title);
+			const std::string_view title = TrimString(g_medium_font, full_title, title_bb.GetWidth());
+			draw_title.clear();
+			fmt::format_to(std::back_inserter(draw_title), "{}{}", title, (title.length() == full_title.length()) ? "" : g_ellipsis);
+			ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+			ImGuiFullscreen::RenderTextClippedWithShadow(
+				title_bb.Min, title_bb.Max, draw_title.c_str(), draw_title.c_str() + draw_title.length(), nullptr, ImVec2(0.5f, 0.0f), &title_bb);
+			ImGui::PopFont();
+
+			if (pressed)
+			{
+				HandleSavedEntryActivate(entry);
+			}
+			else if (hovered && (ImGui::IsItemClicked(ImGuiMouseButton_Right) || ImGui::Shortcut(ImGuiKey_NavGamepadMenu) ||
+									ImGui::Shortcut(ImGuiKey_F3) || ImGui::Shortcut(ImGuiKey_GamepadStart)))
+			{
+				HandleSavedEntryOptions(entry);
+			}
+
+			grid_x++;
+		}
+	}
+
+	EndFullscreenWindow();
+}
+
 void FullscreenUI::DrawGameListWindow()
 {
 	auto game_list_lock = GameList::GetLock();
@@ -2673,26 +3391,111 @@ void FullscreenUI::DrawGameListWindow()
 
 	if (BeginFullscreenWindow(ImVec2(0.0f, 0.0f), heading_size, "gamelist_view", MulAlpha(UIPrimaryColor, bg_alpha)))
 	{
-		static constexpr float ITEM_WIDTH = 25.0f;
-		static constexpr const char* icons[] = {ICON_FA_BORDER_ALL, ICON_FA_LIST};
-		static constexpr const char* titles[] = {FSUI_NSTR("Game Grid"), FSUI_NSTR("Game List")};
-		static constexpr u32 count = std::size(titles);
+		const size_t downloaded_count = Catalog::Manager::GetInstance().GetDownloadedCount();
+		std::string saved_label = fmt::format(FSUI_FSTR("Salvos ({})"), downloaded_count);
 
 		BeginNavBar();
 
 		if (NavButton(ICON_PF_BACKWARD, true, true))
 			SwitchToLanding();
 
-		NavTitle(Host::TranslateToCString(TR_CONTEXT, titles[static_cast<u32>(s_game_list_view)]));
-		RightAlignNavButtons(count, ITEM_WIDTH, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
-
-		for (u32 i = 0; i < count; i++)
+		std::string cat_btn = IsGamepadInputSource() ?
+			fmt::format("{} {}", ICON_PF_LEFT_SHOULDER_LB, FSUI_STR("Catálogo")) :
+			FSUI_STR("Catálogo");
+		if (NavButton(cat_btn.c_str(), s_current_main_nav_tab == MainNavTab::Catalog, true))
 		{
-			if (NavButton(icons[i], static_cast<GameListView>(i) == s_game_list_view, true, ITEM_WIDTH,
-					LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+			s_current_main_nav_tab = MainNavTab::Catalog;
+			QueueResetFocus(FocusResetType::WindowChanged);
+		}
+
+		std::string saved_btn = IsGamepadInputSource() ?
+			fmt::format("{} {}", saved_label, ICON_PF_RIGHT_SHOULDER_RB) :
+			saved_label;
+		if (NavButton(saved_btn.c_str(), s_current_main_nav_tab == MainNavTab::Saved, true))
+		{
+			s_current_main_nav_tab = MainNavTab::Saved;
+			QueueResetFocus(FocusResetType::WindowChanged);
+		}
+
+		RomDownloader::Job active_job;
+		if (RomDownloader::Manager::GetInstance().GetCurrentJob(&active_job))
+		{
+			std::string dl_pill = fmt::format(FSUI_FSTR("{} {:.0f}%"),
+				active_job.IsPaused() ? ICON_FA_PAUSE : ICON_FA_CLOUD_ARROW_DOWN,
+				active_job.progress * 100.0f);
+			if (NavButton(dl_pill.c_str(), true, true))
 			{
-				s_game_list_view = static_cast<GameListView>(i);
+				ImGuiFullscreen::ChoiceDialogOptions dl_opts;
+				if (active_job.IsPaused())
+					dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PLAY, "Retomar Download"), false);
+				else
+					dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PAUSE, "Pausar Download"), false);
+
+				dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_XMARK, "Cancelar Download"), false);
+				dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Fechar"), false);
+
+				OpenChoiceDialog(active_job.fileName.c_str(), false, std::move(dl_opts),
+					[active_job](s32 idx, const std::string&, bool) {
+						if (idx == 0)
+						{
+							if (active_job.IsPaused())
+								RomDownloader::Manager::GetInstance().ResumeCurrentDownload();
+							else
+								RomDownloader::Manager::GetInstance().PauseCurrentDownload();
+						}
+						else if (idx == 1)
+						{
+							RomDownloader::Manager::GetInstance().CancelDownload(active_job.fileName);
+							ShowToast(FSUI_STR("Download"), FSUI_STR("Download cancelado."), 3.0f);
+						}
+						CloseChoiceDialog();
+					});
 			}
+		}
+
+		const std::string& active_search = (s_current_main_nav_tab == MainNavTab::Catalog) ? s_catalog_search_query : s_saved_search_query;
+		if (!active_search.empty())
+		{
+			std::string filter_tag = fmt::format(FSUI_FSTR("{} \"{}\" {}"), ICON_FA_MAGNIFYING_GLASS, active_search, ICON_FA_XMARK);
+			if (NavButton(filter_tag.c_str(), true, true))
+			{
+				if (s_current_main_nav_tab == MainNavTab::Catalog)
+					s_catalog_search_query.clear();
+				else
+					s_saved_search_query.clear();
+			}
+		}
+
+		static constexpr float ITEM_WIDTH = 25.0f;
+		RightAlignNavButtons(3, ITEM_WIDTH, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
+
+		if (NavButton(ICON_FA_MAGNIFYING_GLASS, !active_search.empty(), true, ITEM_WIDTH, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+		{
+			OpenInputStringDialog(
+				FSUI_ICONSTR(ICON_FA_MAGNIFYING_GLASS, "Buscar Jogos"),
+				FSUI_STR("Digite o nome ou parte do título do jogo para filtrar:"),
+				std::string(),
+				FSUI_STR("Buscar"),
+				[](std::string query) {
+					if (s_current_main_nav_tab == MainNavTab::Catalog)
+						s_catalog_search_query = std::move(query);
+					else
+						s_saved_search_query = std::move(query);
+				},
+				active_search);
+		}
+
+		if (NavButton(ICON_FA_ARROW_ROTATE_RIGHT, false, true, ITEM_WIDTH, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+		{
+			ShowToast(std::string(), FSUI_STR("Atualizando biblioteca e pastas de ROMs..."), 3.0f);
+			Catalog::Manager::GetInstance().RescanLocalRoms();
+			Host::RefreshGameListAsync(false);
+		}
+
+		if (NavButton(ICON_FA_GEAR, false, true, ITEM_WIDTH, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+		{
+			s_current_main_window = MainWindowType::GameListSettings;
+			QueueResetFocus(FocusResetType::WindowChanged);
 		}
 
 		EndNavBar();
@@ -2700,32 +3503,53 @@ void FullscreenUI::DrawGameListWindow()
 
 	EndFullscreenWindow();
 
-	if (ImGui::IsKeyPressed(ImGuiKey_NavGamepadContextMenu, false) || ImGui::IsKeyPressed(ImGuiKey_F1, false))
+	if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false))
 	{
-		s_game_list_view = (s_game_list_view == GameListView::Grid) ? GameListView::List : GameListView::Grid;
-	}
-	else if (ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false) || ImGui::IsKeyPressed(ImGuiKey_F2))
-	{
-		s_current_main_window = MainWindowType::GameListSettings;
+		s_current_main_nav_tab = MainNavTab::Catalog;
 		QueueResetFocus(FocusResetType::WindowChanged);
 	}
-	else if (ImGui::IsKeyPressed(ImGuiKey_GamepadBack, false) || ImGui::IsKeyPressed(ImGuiKey_F4, false))
+	else if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false))
 	{
-		OpenCoverDownloaderWindow();
+		s_current_main_nav_tab = MainNavTab::Saved;
+		QueueResetFocus(FocusResetType::WindowChanged);
+	}
+	else if (ImGui::IsKeyPressed(ImGuiKey_NavGamepadMenu, false) || ImGui::IsKeyPressed(ImGuiKey_F1, false) || ImGui::IsKeyPressed(ImGuiKey_Y, false))
+	{
+		const std::string& active_search = (s_current_main_nav_tab == MainNavTab::Catalog) ? s_catalog_search_query : s_saved_search_query;
+		OpenInputStringDialog(
+			FSUI_ICONSTR(ICON_FA_MAGNIFYING_GLASS, "Buscar Jogos"),
+			FSUI_STR("Digite o nome ou parte do título do jogo para filtrar:"),
+			std::string(),
+			FSUI_STR("Buscar"),
+			[](std::string query) {
+				if (s_current_main_nav_tab == MainNavTab::Catalog)
+					s_catalog_search_query = std::move(query);
+				else
+					s_saved_search_query = std::move(query);
+			},
+			active_search);
+	}
+	else if (ImGui::IsKeyPressed(ImGuiKey_NavGamepadContextMenu, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false))
+	{
+		if (s_current_main_nav_tab == MainNavTab::Catalog && !s_catalog_search_query.empty())
+			s_catalog_search_query.clear();
+		else if (s_current_main_nav_tab == MainNavTab::Saved && !s_saved_search_query.empty())
+			s_saved_search_query.clear();
 	}
 	else if (ImGui::IsKeyPressed(ImGuiKey_GamepadL2, false) || ImGui::IsKeyPressed(ImGuiKey_F5, false))
 	{
-		ShowToast(std::string(), FSUI_STR("Scanning for new games..."), 4.0f);
+		ShowToast(std::string(), FSUI_STR("Atualizando biblioteca e pastas de ROMs..."), 4.0f);
+		Catalog::Manager::GetInstance().RescanLocalRoms();
 		Host::RefreshGameListAsync(false);
 	}
 
-	switch (s_game_list_view)
+	switch (s_current_main_nav_tab)
 	{
-		case GameListView::Grid:
-			DrawGameGrid(heading_size);
+		case MainNavTab::Catalog:
+			DrawCatalogGrid(heading_size);
 			break;
-		case GameListView::List:
-			DrawGameList(heading_size);
+		case MainNavTab::Saved:
+			DrawSavedGrid(heading_size);
 			break;
 		default:
 			break;
@@ -2733,7 +3557,6 @@ void FullscreenUI::DrawGameListWindow()
 
 	if (VMManager::GetState() != VMState::Shutdown)
 	{
-		// Dummy window to prevent interacting with the game list while loading.
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
 		ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
 		ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -2746,30 +3569,42 @@ void FullscreenUI::DrawGameListWindow()
 	if (IsGamepadInputSource())
 	{
 		const bool circleOK = ImGui::GetIO().ConfigNavSwapGamepadButtons;
-		const bool swapNorthWest = ImGuiManager::IsGamepadNorthWestSwapped();
 		const auto glyphs = GetGamepadGlyphs();
-		SetFullscreenFooterText(std::array{
-			std::make_pair(glyphs.dpad, FSUI_VSTR("Select Game")),
-			std::make_pair(glyphs.select, FSUI_VSTR("Cover Downloader")),
-			std::make_pair(glyphs.start, FSUI_VSTR("Settings")),
-			std::make_pair(ICON_PF_LEFT_TRIGGER_L2, FSUI_VSTR("Refresh List")),
-			std::make_pair(swapNorthWest ? glyphs.west : glyphs.north, FSUI_VSTR("Change View")),
-			std::make_pair(swapNorthWest ? glyphs.north : glyphs.west, FSUI_VSTR("Launch Options")),
-			std::make_pair(glyphs.confirm(circleOK), FSUI_VSTR("Start Game")),
-			std::make_pair(glyphs.cancel(circleOK), FSUI_VSTR("Back")),
-		});
+		const std::string_view action_text = (s_current_main_nav_tab == MainNavTab::Saved) ? FSUI_VSTR("Jogar") : FSUI_VSTR("Selecionar / Baixar");
+		const std::string& active_search = (s_current_main_nav_tab == MainNavTab::Catalog) ? s_catalog_search_query : s_saved_search_query;
+
+		if (!active_search.empty())
+		{
+			SetFullscreenFooterText(std::array{
+				std::make_pair(glyphs.dpad, FSUI_VSTR("Navegar")),
+				std::make_pair(glyphs.confirm(circleOK), action_text),
+				std::make_pair(glyphs.cancel(circleOK), FSUI_VSTR("Voltar")),
+				std::make_pair(glyphs.west, FSUI_VSTR("Limpar Busca")),
+				std::make_pair(glyphs.north, FSUI_VSTR("Buscar")),
+				std::make_pair(ICON_PF_LEFT_SHOULDER_LB ICON_PF_RIGHT_SHOULDER_RB, FSUI_VSTR("Mudar Aba")),
+			});
+		}
+		else
+		{
+			SetFullscreenFooterText(std::array{
+				std::make_pair(glyphs.dpad, FSUI_VSTR("Navegar")),
+				std::make_pair(glyphs.confirm(circleOK), action_text),
+				std::make_pair(glyphs.cancel(circleOK), FSUI_VSTR("Voltar")),
+				std::make_pair(glyphs.north, FSUI_VSTR("Buscar")),
+				std::make_pair(ICON_PF_LEFT_SHOULDER_LB ICON_PF_RIGHT_SHOULDER_RB, FSUI_VSTR("Mudar Aba")),
+				std::make_pair(glyphs.start, FSUI_VSTR("Opções")),
+			});
+		}
 	}
 	else
 	{
 		SetFullscreenFooterText(std::array{
-			std::make_pair(ICON_PF_ARROW_UP ICON_PF_ARROW_DOWN ICON_PF_ARROW_LEFT ICON_PF_ARROW_RIGHT, FSUI_VSTR("Select Game")),
-			std::make_pair(ICON_PF_F1, FSUI_VSTR("Change View")),
-			std::make_pair(ICON_PF_F2, FSUI_VSTR("Settings")),
-			std::make_pair(ICON_PF_F3, FSUI_VSTR("Launch Options")),
-			std::make_pair(ICON_PF_F4, FSUI_VSTR("Cover Downloader")),
-			std::make_pair(ICON_PF_F5, FSUI_VSTR("Refresh List")),
-			std::make_pair(ICON_PF_ENTER, FSUI_VSTR("Start Game")),
-			std::make_pair(ICON_PF_ESC, FSUI_VSTR("Back")),
+			std::make_pair(ICON_PF_ARROW_UP ICON_PF_ARROW_DOWN ICON_PF_ARROW_LEFT ICON_PF_ARROW_RIGHT, FSUI_VSTR("Navegar")),
+			std::make_pair(ICON_PF_ENTER, FSUI_VSTR("Confirmar")),
+			std::make_pair(ICON_PF_ESC, FSUI_VSTR("Voltar")),
+			std::make_pair(ICON_PF_KEY_Y, FSUI_VSTR("Buscar")),
+			std::make_pair(ICON_PF_KEY_Q ICON_PF_KEY_E, FSUI_VSTR("Mudar Aba")),
+			std::make_pair(ICON_PF_F5, FSUI_VSTR("Atualizar")),
 		});
 	}
 }

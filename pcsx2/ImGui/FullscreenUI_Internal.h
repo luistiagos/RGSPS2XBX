@@ -5,6 +5,7 @@
 
 #include "FullscreenUI.h"
 #include "ImGuiFullscreen.h"
+#include "pcsx2/Catalog.h"
 
 #include "common/Timer.h"
 #include "Input/InputManager.h"
@@ -374,6 +375,31 @@ namespace FullscreenUI
 
 	// Cached list of unsorted game list entries; used to detect changes and re-sort when needed
 	inline std::vector<const GameList::Entry*> s_last_unsorted_entries;
+
+	//////////////////////////////////////////////////////////////////////////
+	// 2-Tab Navigation (Catálogo & Salvos)
+	//////////////////////////////////////////////////////////////////////////
+	enum class MainNavTab : u8
+	{
+		Catalog = 0,
+		Saved = 1,
+		Count = 2
+	};
+
+	inline MainNavTab s_current_main_nav_tab = MainNavTab::Catalog;
+	inline std::string s_catalog_search_query;
+	inline std::string s_saved_search_query;
+
+	void DrawCatalogGrid(const ImVec2& heading_size);
+	void DrawSavedGrid(const ImVec2& heading_size);
+	void DrawCatalogCover(const Catalog::Group& group, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max);
+	void DrawCatalogCardBadges(const Catalog::Group& group, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max);
+	void DrawSavedEntryCover(const Catalog::Entry& entry, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max);
+	void DrawSavedEntryBadges(const Catalog::Entry& entry, ImDrawList* draw_list, const ImVec2& min, const ImVec2& max);
+	void HandleCatalogEntryActivate(size_t group_index);
+	void HandleSavedEntryActivate(const Catalog::Entry* entry);
+	void HandleSavedEntryOptions(const Catalog::Entry* entry);
+	GSTexture* GetCatalogCover(const Catalog::Group& group);
 
 	//////////////////////////////////////////////////////////////////////////
 	// Background
