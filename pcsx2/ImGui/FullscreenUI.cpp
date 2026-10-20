@@ -2675,18 +2675,27 @@ GSTexture* FullscreenUI::GetCatalogCover(const Catalog::Group& group)
 	const std::string sanitized_title = Path::SanitizeFileName(group.title);
 	const std::string local_cover_jpg = Path::Combine(EmuFolders::Covers, sanitized_title + ".jpg");
 	const std::string local_cover_png = Path::Combine(EmuFolders::Covers, sanitized_title + ".png");
+	const std::string local_cover_webp = Path::Combine(EmuFolders::Covers, sanitized_title + ".webp");
 
 	if (FileSystem::FileExists(local_cover_jpg.c_str()))
 		return GetCachedTextureAsync(local_cover_jpg.c_str());
 	if (FileSystem::FileExists(local_cover_png.c_str()))
 		return GetCachedTextureAsync(local_cover_png.c_str());
+	if (FileSystem::FileExists(local_cover_webp.c_str()))
+		return GetCachedTextureAsync(local_cover_webp.c_str());
 
 	if (!group.variants.empty())
 	{
 		const std::string variant_stem = Path::SanitizeFileName(Catalog::Parser::StripExtension(group.variants[0].fileName));
 		const std::string variant_cover_jpg = Path::Combine(EmuFolders::Covers, variant_stem + ".jpg");
+		const std::string variant_cover_png = Path::Combine(EmuFolders::Covers, variant_stem + ".png");
+		const std::string variant_cover_webp = Path::Combine(EmuFolders::Covers, variant_stem + ".webp");
 		if (FileSystem::FileExists(variant_cover_jpg.c_str()))
 			return GetCachedTextureAsync(variant_cover_jpg.c_str());
+		if (FileSystem::FileExists(variant_cover_png.c_str()))
+			return GetCachedTextureAsync(variant_cover_png.c_str());
+		if (FileSystem::FileExists(variant_cover_webp.c_str()))
+			return GetCachedTextureAsync(variant_cover_webp.c_str());
 	}
 
 	// Asynchronous lazy-download of cover if not on disk (needs proper testing on console network)
@@ -2707,16 +2716,22 @@ GSTexture* FullscreenUI::GetCatalogCover(const Catalog::Group& group)
 
 		if (should_request)
 		{
-			std::thread([url = group.coverUrl, dest = local_cover_jpg]() {
+			std::thread([url = group.coverUrl, base_dest = Path::Combine(EmuFolders::Covers, sanitized_title)]() {
 				std::unique_ptr<HTTPDownloader> downloader(HTTPDownloader::Create(Host::GetHTTPUserAgent()));
 				if (!downloader)
 					return;
 
-				downloader->CreateRequest(url, [dest](s32 status_code, const std::string&, HTTPDownloader::Request::Data data) {
+				downloader->CreateRequest(url, [base_dest](s32 status_code, const std::string&, HTTPDownloader::Request::Data data) {
 					if (status_code == HTTPDownloader::HTTP_STATUS_OK && !data.empty())
 					{
 						FileSystem::EnsureDirectoryExists(EmuFolders::Covers.c_str(), false);
-						FileSystem::WriteBinaryFile(dest.c_str(), data.data(), data.size());
+						std::string ext = ".jpg";
+						if (data.size() >= 8 && std::memcmp(data.data(), "\x89PNG\r\n\x1a\n", 8) == 0)
+							ext = ".png";
+						else if (data.size() >= 12 && std::memcmp(data.data(), "RIFF", 4) == 0 && std::memcmp(data.data() + 8, "WEBP", 4) == 0)
+							ext = ".webp";
+						const std::string target_file = base_dest + ext;
+						FileSystem::WriteBinaryFile(target_file.c_str(), data.data(), data.size());
 					}
 				});
 				downloader->WaitForAllRequests();
@@ -2756,9 +2771,21 @@ void FullscreenUI::DrawCatalogCardBadges(const Catalog::Group& group, ImDrawList
 	const ImVec2 tr_pos(max.x - badge_padding - badge_radius * 2.0f, min.y + badge_padding);
 	const ImRect badge_rect(tr_pos, tr_pos + ImVec2(badge_radius * 2.0f, badge_radius * 2.0f));
 
-	const auto& primary = group.GetPrimaryEntry();
-	const bool is_downloading = primary.isDownloading || RomDownloader::Manager::GetInstance().IsGameDownloading(primary.fileName);
-	const bool is_paused = primary.isPaused || RomDownloader::Manager::GetInstance().IsGamePaused(primary.fileName);
+	bool is_downloading = false;
+	bool is_paused = false;
+	float download_progress = 0.0f;
+
+	for (const auto& variant : group.variants)
+	{
+		if (variant.isDownloading || RomDownloader::Manager::GetInstance().IsGameDownloading(variant.fileName))
+		{
+			is_downloading = true;
+			download_progress = variant.downloadProgress;
+			if (variant.isPaused || RomDownloader::Manager::GetInstance().IsGamePaused(variant.fileName))
+				is_paused = true;
+			break;
+		}
+	}
 
 	if (is_downloading)
 	{
@@ -2784,13 +2811,20 @@ void FullscreenUI::DrawCatalogCardBadges(const Catalog::Group& group, ImDrawList
 		const ImVec2 bar_bg_max(max.x, max.y);
 		draw_list->AddRectFilled(bar_bg_min, bar_bg_max, IM_COL32(20, 20, 20, 230), LayoutScale(2.0f));
 
-		const float pct = std::clamp(primary.downloadProgress, 0.0f, 1.0f);
+		const float pct = std::clamp(download_progress, 0.0f, 1.0f);
 		const ImVec2 bar_fill_max(min.x + (max.x - min.x) * pct, max.y);
 		draw_list->AddRectFilled(bar_bg_min, bar_fill_max,
 			is_paused ? IM_COL32(230, 162, 20, 240) : IM_COL32(0, 122, 255, 240), LayoutScale(2.0f));
 
-		// Text pill showing percent
-		std::string pct_text = fmt::format("{:.0f}%", pct * 100.0f);
+		// Text pill showing percent or downloading status
+		std::string pct_text;
+		if (pct > 0.0f)
+			pct_text = fmt::format("{:.0f}%", pct * 100.0f);
+		else if (is_paused)
+			pct_text = "Pausado";
+		else
+			pct_text = "Baixando...";
+
 		ImGui::PushFont(g_medium_font.first, g_medium_font.second);
 		const ImVec2 ptxt_sz = ImGui::CalcTextSize(pct_text.c_str());
 		const ImVec2 ptxt_pos(bar_bg_min.x + ((bar_bg_max.x - bar_bg_min.x) - ptxt_sz.x) * 0.5f,
@@ -2807,12 +2841,12 @@ void FullscreenUI::DrawCatalogCardBadges(const Catalog::Group& group, ImDrawList
 		const ImVec2 isz = ImGui::CalcTextSize(icon);
 		draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(255, 255, 255, 255), icon);
 	}
-	else
+	else if (group.hasDirectDownload)
 	{
-		draw_list->AddCircleFilled(badge_rect.GetCenter(), badge_radius, IM_COL32(20, 20, 20, 195));
+		draw_list->AddCircleFilled(badge_rect.GetCenter(), badge_radius, IM_COL32(0, 122, 255, 235));
 		const char* icon = ICON_FA_CLOUD_ARROW_DOWN;
 		const ImVec2 isz = ImGui::CalcTextSize(icon);
-		draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(230, 230, 230, 255), icon);
+		draw_list->AddText(badge_rect.GetCenter() - isz * 0.5f, IM_COL32(255, 255, 255, 255), icon);
 	}
 
 	if (group.variants.size() > 1)
@@ -2837,8 +2871,27 @@ void FullscreenUI::DrawSavedEntryCover(const Catalog::Entry& entry, ImDrawList* 
 	{
 		const std::string sanitized_title = Path::SanitizeFileName(entry.title);
 		const std::string local_cover_jpg = Path::Combine(EmuFolders::Covers, sanitized_title + ".jpg");
+		const std::string local_cover_png = Path::Combine(EmuFolders::Covers, sanitized_title + ".png");
+		const std::string local_cover_webp = Path::Combine(EmuFolders::Covers, sanitized_title + ".webp");
 		if (FileSystem::FileExists(local_cover_jpg.c_str()))
 			cover_texture = GetCachedTextureAsync(local_cover_jpg.c_str());
+		else if (FileSystem::FileExists(local_cover_png.c_str()))
+			cover_texture = GetCachedTextureAsync(local_cover_png.c_str());
+		else if (FileSystem::FileExists(local_cover_webp.c_str()))
+			cover_texture = GetCachedTextureAsync(local_cover_webp.c_str());
+		else if (!entry.fileName.empty())
+		{
+			const std::string stem = Path::SanitizeFileName(Catalog::Parser::StripExtension(entry.fileName));
+			const std::string stem_jpg = Path::Combine(EmuFolders::Covers, stem + ".jpg");
+			const std::string stem_png = Path::Combine(EmuFolders::Covers, stem + ".png");
+			const std::string stem_webp = Path::Combine(EmuFolders::Covers, stem + ".webp");
+			if (FileSystem::FileExists(stem_jpg.c_str()))
+				cover_texture = GetCachedTextureAsync(stem_jpg.c_str());
+			else if (FileSystem::FileExists(stem_png.c_str()))
+				cover_texture = GetCachedTextureAsync(stem_png.c_str());
+			else if (FileSystem::FileExists(stem_webp.c_str()))
+				cover_texture = GetCachedTextureAsync(stem_webp.c_str());
+		}
 	}
 
 	if (cover_texture)
@@ -2911,15 +2964,17 @@ void FullscreenUI::HandleCatalogEntryActivate(size_t group_index)
 					else if (idx == 1)
 					{
 						OpenConfirmMessageDialog(
-							FSUI_ICONSTR(ICON_FA_TRASH_CAN, "Cancelar Download"),
+							FSUI_ICONSTR(ICON_FA_TRIANGLE_EXCLAMATION, "Cancelar Download"),
 							fmt::format(FSUI_FSTR("Deseja realmente cancelar o download de '{}'?"), variant.fileName),
 							[variant](bool confirmed) {
 								if (confirmed)
 								{
 									RomDownloader::Manager::GetInstance().CancelDownload(variant.fileName);
-									ShowToast(FSUI_STR("Download"), FSUI_STR("Download cancelado."), 3.0f);
+									ShowToast(FSUI_ICONSTR(ICON_FA_XMARK, "Download"), FSUI_STR("Download cancelado com sucesso."), 3.0f);
 								}
-							}, false);
+							}, false,
+							FSUI_ICONSTR(ICON_FA_CHECK, "Sim"),
+							FSUI_ICONSTR(ICON_FA_XMARK, "Não"));
 					}
 					CloseChoiceDialog();
 				});
@@ -2932,23 +2987,40 @@ void FullscreenUI::HandleCatalogEntryActivate(size_t group_index)
 		}
 		else
 		{
+			// Check if download mirrors are available (needs proper testing)
+			const std::vector<std::string> sources = RomDownloader::Manager::GetInstance().ResolveSources(variant);
+			if (sources.empty())
+			{
+				CloseChoiceDialog();
+				ImGuiFullscreen::OpenInfoMessageDialog(
+					FSUI_ICONSTR(ICON_FA_CIRCLE_EXCLAMATION, "Download Indisponível"),
+					fmt::format(FSUI_FSTR("O jogo '{}' está presente no catálogo para visualização de capa e informações, mas não possui servidor de download direto no momento.\n\nJogos com o ícone de nuvem azul na capa possuem download direto de alta velocidade.\n\nPara este título, você pode copiar sua própria ISO ou CHD para a pasta roms/ e ele aparecerá na aba Salvos pronto para jogar."),
+						variant.fileName));
+				return;
+			}
+
+			CloseChoiceDialog();
 			OpenConfirmMessageDialog(
 				FSUI_ICONSTR(ICON_FA_CLOUD_ARROW_DOWN, "Confirmar Download"),
-				fmt::format(FSUI_FSTR("Deseja baixar '{}'?\n\nO jogo será gravado diretamente em disco e adicionado à aba Salvos pronto para jogar."),
+				fmt::format(FSUI_FSTR("Deseja baixar '{}'?\n\nO jogo será gravado no seu armazenamento e adicionado à aba Salvos pronto para jogar."),
 					variant.fileName),
 				[variant](bool confirmed) {
 					if (confirmed)
 					{
 						if (RomDownloader::Manager::GetInstance().EnqueueDownload(variant))
 						{
-							ShowToast(FSUI_STR("Download"), fmt::format(FSUI_FSTR("Download de '{}' adicionado à fila."), variant.fileName), 4.0f);
+							ShowToast(FSUI_ICONSTR(ICON_FA_CLOUD_ARROW_DOWN, "Download"),
+								fmt::format(FSUI_FSTR("Download de '{}' iniciado e adicionado à fila."), variant.fileName), 4.0f);
 						}
 						else
 						{
-							ShowToast(FSUI_STR("Download"), FSUI_STR("O jogo já se encontra na fila de download."), 4.0f);
+							ShowToast(FSUI_ICONSTR(ICON_FA_CIRCLE_INFO, "Download"),
+								FSUI_STR("O jogo já se encontra na fila de download."), 4.0f);
 						}
 					}
-				}, true);
+				}, true,
+				FSUI_ICONSTR(ICON_FA_DOWNLOAD, "Baixar"),
+				FSUI_ICONSTR(ICON_FA_XMARK, "Cancelar"));
 		}
 	};
 
@@ -2964,6 +3036,8 @@ void FullscreenUI::HandleCatalogEntryActivate(size_t group_index)
 				label = fmt::format("{} {} [{}] (Baixando...)", ICON_FA_CLOUD_ARROW_DOWN, v.fileName, v.IsChd() ? "CHD" : "ISO");
 			else if (v.isDownloaded)
 				label = fmt::format("{} {} [{}] (Baixado)", ICON_FA_PLAY, v.fileName, v.IsChd() ? "CHD" : "ISO");
+			else if (RomDownloader::Manager::GetInstance().ResolveSources(v).empty())
+				label = fmt::format("{} {} [{}] (Apenas Catálogo)", ICON_FA_BOOK, v.fileName, v.IsChd() ? "CHD" : "ISO");
 			else
 				label = fmt::format("{} {} [{}] (Baixar)", ICON_FA_CLOUD_ARROW_DOWN, v.fileName, v.IsChd() ? "CHD" : "ISO");
 			options.emplace_back(std::move(label), false);
@@ -2971,12 +3045,60 @@ void FullscreenUI::HandleCatalogEntryActivate(size_t group_index)
 		options.emplace_back(FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Cancelar"), false);
 
 		OpenChoiceDialog(group->title.c_str(), false, std::move(options),
-			[group_index, handle_variant_action](s32 index, const std::string&, bool) {
+			[group_index](s32 index, const std::string&, bool) {
+				CloseChoiceDialog();
+
 				const Catalog::Group* g = Catalog::Manager::GetInstance().GetGroup(group_index);
 				if (!g || index < 0 || static_cast<size_t>(index) >= g->variants.size())
 					return;
 
-				handle_variant_action(g->variants[index]);
+				const auto& selected_variant = g->variants[index];
+				if (selected_variant.isDownloaded && !selected_variant.localPath.empty())
+				{
+					DoStartPath(selected_variant.localPath);
+				}
+				else if (RomDownloader::Manager::GetInstance().IsGameDownloading(selected_variant.fileName))
+				{
+					const bool is_p = RomDownloader::Manager::GetInstance().IsGamePaused(selected_variant.fileName);
+					ImGuiFullscreen::ChoiceDialogOptions dl_opts;
+					if (is_p)
+						dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PLAY, "Retomar Download"), false);
+					else
+						dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PAUSE, "Pausar Download"), false);
+
+					dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_XMARK, "Cancelar Download"), false);
+					dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Fechar"), false);
+
+					OpenChoiceDialog(selected_variant.fileName.c_str(), false, std::move(dl_opts),
+						[selected_variant, is_p](s32 idx, const std::string&, bool) {
+							CloseChoiceDialog();
+							if (idx == 0)
+							{
+								if (is_p)
+									RomDownloader::Manager::GetInstance().ResumeCurrentDownload();
+								else
+									RomDownloader::Manager::GetInstance().PauseCurrentDownload();
+							}
+							else if (idx == 1)
+							{
+								RomDownloader::Manager::GetInstance().CancelDownload(selected_variant.fileName);
+								ShowToast(FSUI_ICONSTR(ICON_FA_XMARK, "Download"), FSUI_STR("Download cancelado com sucesso."), 3.0f);
+							}
+						});
+				}
+				else
+				{
+					if (RomDownloader::Manager::GetInstance().EnqueueDownload(selected_variant))
+					{
+						ShowToast(FSUI_ICONSTR(ICON_FA_CLOUD_ARROW_DOWN, "Download"),
+							fmt::format(FSUI_FSTR("Download de '{}' iniciado e adicionado à fila."), selected_variant.fileName), 4.0f);
+					}
+					else
+					{
+						ShowToast(FSUI_ICONSTR(ICON_FA_CIRCLE_INFO, "Download"),
+							FSUI_STR("O jogo já se encontra na fila de download."), 4.0f);
+					}
+				}
 			});
 	}
 	else
@@ -3075,7 +3197,6 @@ void FullscreenUI::DrawCatalogGrid(const ImVec2& heading_size)
 		SwitchToLanding();
 
 	ResetFocusHere();
-	BeginMenuButtons();
 
 	auto& cat_mgr = Catalog::Manager::GetInstance();
 	if (!cat_mgr.IsLoaded())
@@ -3202,9 +3323,9 @@ void FullscreenUI::DrawCatalogGrid(const ImVec2& heading_size)
 			{
 				HandleCatalogEntryActivate(grp_idx);
 			}
-
-			grid_x++;
 		}
+
+		grid_x++;
 	}
 
 	EndFullscreenWindow();
@@ -3226,7 +3347,6 @@ void FullscreenUI::DrawSavedGrid(const ImVec2& heading_size)
 		SwitchToLanding();
 
 	ResetFocusHere();
-	BeginMenuButtons();
 
 	const std::vector<Catalog::Entry> all_saved = Catalog::Manager::GetInstance().GetDownloadedEntries();
 	std::vector<const Catalog::Entry*> filtered_saved;
@@ -3369,9 +3489,9 @@ void FullscreenUI::DrawSavedGrid(const ImVec2& heading_size)
 			{
 				HandleSavedEntryOptions(entry);
 			}
-
-			grid_x++;
 		}
+
+		grid_x++;
 	}
 
 	EndFullscreenWindow();
@@ -3418,35 +3538,69 @@ void FullscreenUI::DrawGameListWindow()
 		}
 
 		RomDownloader::Job active_job;
-		if (RomDownloader::Manager::GetInstance().GetCurrentJob(&active_job))
+		const bool has_active_job = RomDownloader::Manager::GetInstance().GetCurrentJob(&active_job);
+		const size_t queue_count = RomDownloader::Manager::GetInstance().GetQueueCount();
+
+		if (has_active_job || queue_count > 0)
 		{
-			std::string dl_pill = fmt::format(FSUI_FSTR("{} {:.0f}%"),
-				active_job.IsPaused() ? ICON_FA_PAUSE : ICON_FA_CLOUD_ARROW_DOWN,
-				active_job.progress * 100.0f);
+			std::string dl_pill;
+			if (has_active_job)
+			{
+				const char* icon = active_job.IsPaused() ? ICON_FA_PAUSE : ICON_FA_CLOUD_ARROW_DOWN;
+				if (queue_count > 0)
+				{
+					dl_pill = fmt::format(FSUI_FSTR("{} {:.0f}% (+{})"), icon, active_job.progress * 100.0f, queue_count);
+				}
+				else
+				{
+					dl_pill = fmt::format(FSUI_FSTR("{} {:.0f}%"), icon, active_job.progress * 100.0f);
+				}
+			}
+			else
+			{
+				dl_pill = fmt::format(FSUI_FSTR("{} Na Fila ({})"), ICON_FA_CLOUD_ARROW_DOWN, queue_count);
+			}
+
 			if (NavButton(dl_pill.c_str(), true, true))
 			{
 				ImGuiFullscreen::ChoiceDialogOptions dl_opts;
-				if (active_job.IsPaused())
-					dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PLAY, "Retomar Download"), false);
-				else
-					dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PAUSE, "Pausar Download"), false);
+				if (has_active_job)
+				{
+					if (active_job.IsPaused())
+						dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PLAY, "Retomar Download"), false);
+					else
+						dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_PAUSE, "Pausar Download"), false);
 
-				dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_XMARK, "Cancelar Download"), false);
+					dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_XMARK, "Cancelar Download Atual"), false);
+				}
+
+				if (queue_count > 0)
+				{
+					dl_opts.emplace_back(fmt::format(FSUI_FSTR("Itens aguardando na fila: {}"), queue_count), false);
+				}
+
 				dl_opts.emplace_back(FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Fechar"), false);
 
-				OpenChoiceDialog(active_job.fileName.c_str(), false, std::move(dl_opts),
-					[active_job](s32 idx, const std::string&, bool) {
-						if (idx == 0)
+				std::string dialog_title = has_active_job ?
+					fmt::format(FSUI_FSTR("Download: {} ({})"), active_job.title, active_job.statusMessage) :
+					fmt::format(FSUI_FSTR("Fila de Downloads ({} na espera)"), queue_count);
+
+				OpenChoiceDialog(dialog_title.c_str(), false, std::move(dl_opts),
+					[active_job, has_active_job](s32 idx, const std::string&, bool) {
+						if (has_active_job)
 						{
-							if (active_job.IsPaused())
-								RomDownloader::Manager::GetInstance().ResumeCurrentDownload();
-							else
-								RomDownloader::Manager::GetInstance().PauseCurrentDownload();
-						}
-						else if (idx == 1)
-						{
-							RomDownloader::Manager::GetInstance().CancelDownload(active_job.fileName);
-							ShowToast(FSUI_STR("Download"), FSUI_STR("Download cancelado."), 3.0f);
+							if (idx == 0)
+							{
+								if (active_job.IsPaused())
+									RomDownloader::Manager::GetInstance().ResumeCurrentDownload();
+								else
+									RomDownloader::Manager::GetInstance().PauseCurrentDownload();
+							}
+							else if (idx == 1)
+							{
+								RomDownloader::Manager::GetInstance().CancelDownload(active_job.fileName);
+								ShowToast(FSUI_ICONSTR(ICON_FA_XMARK, "Download"), FSUI_STR("Download cancelado."), 3.0f);
+							}
 						}
 						CloseChoiceDialog();
 					});

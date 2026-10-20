@@ -127,10 +127,37 @@ bool RGBA8Image::SaveToFile(const char* filename, u8 quality) const
 
 bool RGBA8Image::LoadFromFile(const char* filename, std::FILE* fp)
 {
-	const std::string_view extension(Path::GetExtension(filename));
-	const FormatHandler* handler = GetFormatHandler(extension);
+	u8 magic[12];
+	const size_t bytes_read = std::fread(magic, 1, sizeof(magic), fp);
+	std::fseek(fp, 0, SEEK_SET);
+
+	const FormatHandler* handler = nullptr;
+	// Sniff magic bytes first (needs proper testing with various image sources)
+	if (bytes_read >= 8 && std::memcmp(magic, "\x89PNG\r\n\x1a\n", 8) == 0)
+	{
+		handler = GetFormatHandler("png");
+	}
+	else if (bytes_read >= 12 && std::memcmp(magic, "RIFF", 4) == 0 && std::memcmp(magic + 8, "WEBP", 4) == 0)
+	{
+		handler = GetFormatHandler("webp");
+	}
+	else if (bytes_read >= 3 && magic[0] == 0xFF && magic[1] == 0xD8 && magic[2] == 0xFF)
+	{
+		handler = GetFormatHandler("jpg");
+	}
+	else if (bytes_read >= 2 && std::memcmp(magic, "BM", 2) == 0)
+	{
+		handler = GetFormatHandler("bmp");
+	}
+	else
+	{
+		const std::string_view extension(Path::GetExtension(filename));
+		handler = GetFormatHandler(extension);
+	}
+
 	if (!handler || !handler->file_loader)
 	{
+		const std::string_view extension(Path::GetExtension(filename));
 		Console.ErrorFmt("Unknown extension '{}'", extension);
 		return false;
 	}
@@ -140,10 +167,35 @@ bool RGBA8Image::LoadFromFile(const char* filename, std::FILE* fp)
 
 bool RGBA8Image::LoadFromBuffer(const char* filename, const void* buffer, size_t buffer_size)
 {
-	const std::string_view extension(Path::GetExtension(filename));
-	const FormatHandler* handler = GetFormatHandler(extension);
+	const u8* bytes = static_cast<const u8*>(buffer);
+	const FormatHandler* handler = nullptr;
+
+	// Sniff magic bytes to support WebP/PNG images regardless of file extension
+	if (buffer_size >= 8 && std::memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) == 0)
+	{
+		handler = GetFormatHandler("png");
+	}
+	else if (buffer_size >= 12 && std::memcmp(bytes, "RIFF", 4) == 0 && std::memcmp(bytes + 8, "WEBP", 4) == 0)
+	{
+		handler = GetFormatHandler("webp");
+	}
+	else if (buffer_size >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+	{
+		handler = GetFormatHandler("jpg");
+	}
+	else if (buffer_size >= 2 && std::memcmp(bytes, "BM", 2) == 0)
+	{
+		handler = GetFormatHandler("bmp");
+	}
+	else
+	{
+		const std::string_view extension(Path::GetExtension(filename));
+		handler = GetFormatHandler(extension);
+	}
+
 	if (!handler || !handler->buffer_loader)
 	{
+		const std::string_view extension(Path::GetExtension(filename));
 		Console.ErrorFmt("Unknown extension '{}'", extension);
 		return false;
 	}

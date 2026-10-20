@@ -385,8 +385,8 @@ namespace Catalog
 			if (isHttpUrl(title))
 				title = StripExtension(fileName);
 
-			// Discard entries whose download URL is an archive (no extraction in V1)
-			if (!downloadUrl.empty() && IsArchiveUrl(downloadUrl))
+			// Strict filter: accept only titles with an active direct .chd / .iso download link
+			if (downloadUrl.empty() || IsArchiveUrl(downloadUrl))
 				return false;
 
 			if (out_entry)
@@ -478,6 +478,19 @@ namespace Catalog
 		if (it != m_group_map.end() && it->second < m_groups.size())
 			return &m_groups[it->second];
 		return nullptr;
+	}
+
+	std::vector<std::string> Manager::GetGroupVariantFileNames(const std::string_view groupKey) const
+	{
+		std::lock_guard<std::recursive_mutex> lock(m_mutex);
+		std::vector<std::string> fileNames;
+		const auto it = m_group_map.find(std::string(groupKey));
+		if (it != m_group_map.end() && it->second < m_groups.size())
+		{
+			for (const auto& variant : m_groups[it->second].variants)
+				fileNames.push_back(variant.fileName);
+		}
+		return fileNames;
 	}
 
 	std::vector<size_t> Manager::SearchGroups(const std::string_view query) const
@@ -1026,6 +1039,17 @@ namespace Catalog
 					}
 				}
 			}
+
+			bool group_has_dl = false;
+			for (const auto& v : group.variants)
+			{
+				if (v.HasDirectDownload())
+				{
+					group_has_dl = true;
+					break;
+				}
+			}
+			group.hasDirectDownload = group_has_dl;
 		}
 	}
 }

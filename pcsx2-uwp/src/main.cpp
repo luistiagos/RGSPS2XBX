@@ -368,8 +368,10 @@ bool WinRTHost::InitializeConfig()
 				{
 					s_settings_interface->SetStringValue("Filenames", "BIOS", EMBEDDED_BIOS_FILENAME);
 					EmuConfig.BaseFilenames.Bios = EMBEDDED_BIOS_FILENAME;
-					auto lock = Host::GetSettingsLock();
-					s_settings_interface->Save(&error);
+					{
+						auto lock = Host::GetSettingsLock();
+						s_settings_interface->Save(&error);
+					}
 					VMManager::Internal::UpdateEmuFolders();
 				}
 			}

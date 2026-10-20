@@ -186,6 +186,7 @@ namespace ImGuiFullscreen
 	static float s_notification_vertical_direction = 1.0f;
 	static float s_notification_horizontal_position = 0.0f; // 0.0 = left, 0.5 = center, 1.0 = right
 
+	static std::mutex s_toast_mutex;
 	static std::string s_toast_title;
 	static std::string s_toast_message;
 	static Common::Timer::Value s_toast_start_time;
@@ -3293,6 +3294,7 @@ void ImGuiFullscreen::DrawNotifications(ImVec2& position, float spacing)
 
 void ImGuiFullscreen::ShowToast(std::string title, std::string message, float duration)
 {
+	std::lock_guard<std::mutex> lock(s_toast_mutex);
 	s_toast_title = std::move(title);
 	s_toast_message = std::move(message);
 	s_toast_start_time = Common::Timer::GetCurrentValue();
@@ -3301,26 +3303,39 @@ void ImGuiFullscreen::ShowToast(std::string title, std::string message, float du
 
 void ImGuiFullscreen::ClearToast()
 {
-	s_toast_message = {};
-	s_toast_title = {};
+	std::lock_guard<std::mutex> lock(s_toast_mutex);
+	s_toast_message.clear();
+	s_toast_title.clear();
 	s_toast_start_time = 0;
 	s_toast_duration = 0.0f;
 }
 
 void ImGuiFullscreen::DrawToast()
 {
-	if (s_toast_title.empty() && s_toast_message.empty())
-		return;
+	std::string title;
+	std::string message;
+	Common::Timer::Value start_time = 0;
+	float duration = 0.0f;
+	{
+		std::lock_guard<std::mutex> lock(s_toast_mutex);
+		if (s_toast_title.empty() && s_toast_message.empty())
+			return;
 
-	const float elapsed = static_cast<float>(Common::Timer::ConvertValueToSeconds(Common::Timer::GetCurrentValue() - s_toast_start_time));
-	if (elapsed >= s_toast_duration)
+		title = s_toast_title;
+		message = s_toast_message;
+		start_time = s_toast_start_time;
+		duration = s_toast_duration;
+	}
+
+	const float elapsed = static_cast<float>(Common::Timer::ConvertValueToSeconds(Common::Timer::GetCurrentValue() - start_time));
+	if (elapsed >= duration)
 	{
 		ClearToast();
 		return;
 	}
 
 	// fade out the last second
-	const float alpha = std::min(std::min(elapsed * 4.0f, s_toast_duration - elapsed), 1.0f);
+	const float alpha = std::min(std::min(elapsed * 4.0f, duration - elapsed), 1.0f);
 
 	const float max_width = LayoutScale(600.0f);
 
@@ -3329,16 +3344,16 @@ void ImGuiFullscreen::DrawToast()
 	const float padding = LayoutScale(20.0f);
 	const float total_padding = padding * 2.0f;
 	const float margin = LayoutScale(20.0f + (s_fullscreen_footer_text.empty() ? 0.0f : LAYOUT_FOOTER_HEIGHT));
-	const float spacing = (s_toast_title.empty() || s_toast_message.empty()) ? 0.0f : LayoutScale(10.0f);
+	const float spacing = (title.empty() || message.empty()) ? 0.0f : LayoutScale(10.0f);
 	const ImVec2 display_size(ImGui::GetIO().DisplaySize);
-	const ImVec2 title_size(s_toast_title.empty() ? ImVec2(0.0f, 0.0f) :
+	const ImVec2 title_size(title.empty() ? ImVec2(0.0f, 0.0f) :
 													title_font.first->CalcTextSizeA(title_font.second, FLT_MAX, max_width,
-														s_toast_title.c_str(), s_toast_title.c_str() + s_toast_title.length()));
-	const float max_message_width = std::max(LayoutScale(100.0f), max_width - (s_toast_title.empty() ? 0.0f : (title_size.x + spacing)));
-	const ImVec2 message_size(s_toast_message.empty() ? ImVec2(0.0f, 0.0f) :
+														title.c_str(), title.c_str() + title.length()));
+	const float max_message_width = std::max(LayoutScale(100.0f), max_width - (title.empty() ? 0.0f : (title_size.x + spacing)));
+	const ImVec2 message_size(message.empty() ? ImVec2(0.0f, 0.0f) :
 														message_font.first->CalcTextSizeA(message_font.second, FLT_MAX, max_message_width,
-															s_toast_message.c_str(), s_toast_message.c_str() + s_toast_message.length()));
-	const ImVec2 comb_size(s_toast_title.empty() ? message_size.x : (title_size.x + spacing + message_size.x),
+															message.c_str(), message.c_str() + message.length()));
+	const ImVec2 comb_size(title.empty() ? message_size.x : (title_size.x + spacing + message_size.x),
 		std::max(title_size.y, message_size.y));
 
 	const ImVec2 box_size(comb_size.x + total_padding, comb_size.y + total_padding);
@@ -3347,20 +3362,20 @@ void ImGuiFullscreen::DrawToast()
 	ImDrawList* dl = ImGui::GetForegroundDrawList();
 	dl->AddRectFilled(box_pos, box_pos + box_size, ImGui::GetColorU32(ModAlpha(UIPrimaryColor, alpha)), padding);
 	const u32 shadow_col = IM_COL32(0, 0, 0, static_cast<int>(64.0f * alpha));
-	if (!s_toast_title.empty())
+	if (!title.empty())
 	{
 		const ImVec2 title_pos = box_pos + ImVec2(padding, padding + (comb_size.y - title_size.y) * 0.5f);
 		AddTextWithShadow(dl, title_font, title_pos,
-			ImGui::GetColorU32(ModAlpha(UIPrimaryTextColor, alpha)), s_toast_title.c_str(), s_toast_title.c_str() + s_toast_title.length(),
+			ImGui::GetColorU32(ModAlpha(UIPrimaryTextColor, alpha)), title.c_str(), title.c_str() + title.length(),
 			max_width, nullptr, shadow_col);
 	}
-	if (!s_toast_message.empty())
+	if (!message.empty())
 	{
-		const float title_offset = s_toast_title.empty() ? 0.0f : (title_size.x + spacing);
+		const float title_offset = title.empty() ? 0.0f : (title_size.x + spacing);
 		const ImVec2 message_pos = box_pos + ImVec2(padding + title_offset, padding + (comb_size.y - message_size.y) * 0.5f);
 		AddTextWithShadow(dl, message_font, message_pos,
-			ImGui::GetColorU32(ModAlpha(UIPrimaryTextColor, alpha)), s_toast_message.c_str(),
-			s_toast_message.c_str() + s_toast_message.length(), max_message_width, nullptr, shadow_col);
+			ImGui::GetColorU32(ModAlpha(UIPrimaryTextColor, alpha)), message.c_str(),
+			message.c_str() + message.length(), max_message_width, nullptr, shadow_col);
 	}
 }
 

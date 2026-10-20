@@ -275,6 +275,15 @@ bool HTTPDownloaderWinHttp::StartRequest(HTTPDownloader::Request* request)
 		return false;
 	}
 
+	// Ensure redirects across CDNs and domains are automatically followed (needs proper testing)
+	const DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+	WinHttpSetOption(req->hRequest, WINHTTP_OPTION_REDIRECT_POLICY, (LPVOID)&redirect_policy, sizeof(redirect_policy));
+
+	// Tolerate CDN and mirror certificate mismatches
+	const DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+		SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+	WinHttpSetOption(req->hRequest, WINHTTP_OPTION_SECURITY_FLAGS, (LPVOID)&sec_flags, sizeof(sec_flags));
+
 	BOOL result;
 	if (req->type == HTTPDownloader::Request::Type::Post)
 	{

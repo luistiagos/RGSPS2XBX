@@ -93,13 +93,16 @@ namespace RomDownloader
 
 		FileSystem::EnsureDirectoryExists(targetDir.c_str(), true);
 
+		// Sanitize file name to avoid nested path issues
+		const std::string cleanFileName(Path::GetFileName(entry.fileName));
+
 		Job job;
-		job.fileName = entry.fileName;
-		job.title = entry.title.empty() ? Catalog::Parser::BaseTitle(entry.fileName) : entry.title;
+		job.fileName = cleanFileName;
+		job.title = entry.title.empty() ? Catalog::Parser::BaseTitle(cleanFileName) : entry.title;
 		job.directUrl = entry.downloadUrl;
 		job.destinationFolder = targetDir;
-		job.finalPath = Path::Combine(targetDir, entry.fileName);
-		job.partPath = Path::Combine(targetDir, entry.fileName + ".part");
+		job.finalPath = Path::Combine(targetDir, cleanFileName);
+		job.partPath = Path::Combine(targetDir, cleanFileName + ".part");
 		job.status = DownloadStatus::Queued;
 		job.statusMessage = "Na fila de download...";
 
@@ -107,7 +110,7 @@ namespace RomDownloader
 		Catalog::Manager::GetInstance().UpdateDownloadProgress(job.fileName, true, false, 0.0f, 0, 0);
 
 		m_queue.push_back(std::move(job));
-		Console.WriteLn("RomDownloader: Queued '%s' for download to '%s'", entry.fileName.c_str(), targetDir.c_str());
+		Console.WriteLn("RomDownloader: Queued '%s' for download to '%s'", cleanFileName.c_str(), targetDir.c_str());
 		return true;
 	}
 
@@ -232,6 +235,18 @@ namespace RomDownloader
 		return false;
 	}
 
+	size_t Manager::GetQueueCount() const
+	{
+		std::lock_guard<std::recursive_mutex> lock(m_mutex);
+		return m_queue.size();
+	}
+
+	std::vector<Job> Manager::GetQueueJobs() const
+	{
+		std::lock_guard<std::recursive_mutex> lock(m_mutex);
+		return std::vector<Job>(m_queue.begin(), m_queue.end());
+	}
+
 	void Manager::OnVMStarting()
 	{
 		// Auto-pause background downloads when emulation begins to reserve 100% CPU/GPU and I/O
@@ -248,33 +263,39 @@ namespace RomDownloader
 	{
 		std::vector<std::string> sources;
 
+		auto add_unique = [&sources](std::string url) {
+			if (!url.empty() && std::find(sources.begin(), sources.end(), url) == sources.end())
+				sources.push_back(std::move(url));
+		};
+
 		// 1. Direct manifest URL if present and meets strict .chd / .iso format filter
 		if (!entry.downloadUrl.empty())
 		{
 			if (Catalog::Parser::IsSupportedFormat(entry.downloadUrl) && !Catalog::Parser::IsArchiveUrl(entry.downloadUrl))
 			{
-				sources.push_back(entry.downloadUrl);
+				add_unique(entry.downloadUrl);
 			}
 		}
 
-		// URL encode filename for mirror query
-		const std::string encoded_fn = Path::URLEncode(entry.fileName);
-
-		// 2. High-speed Hugging Face mirrors for pure .chd PlayStation 2 games
-		if (entry.IsChd() || StringUtil::EndsWithNoCase(entry.fileName, ".chd"))
+		// 2. If this specific variant doesn't have a direct URL, check if another variant
+		// in the same catalog group (e.g. USA release or base version) has an active download mirror
+		// (needs proper testing)
+		if (sources.empty() && !entry.groupKey.empty())
 		{
-			sources.push_back(fmt::format("https://huggingface.co/datasets/luistiagos/ps2chd/resolve/main/{}", encoded_fn));
-		}
-
-		// 3. Internet Archive high-speed mirrors
-		if (entry.IsChd())
-		{
-			sources.push_back(fmt::format("https://archive.org/download/ps2_chd_collection/{}", encoded_fn));
-			sources.push_back(fmt::format("https://archive.org/download/chd_ps2/{}", encoded_fn));
-		}
-		else if (entry.IsIso())
-		{
-			sources.push_back(fmt::format("https://archive.org/download/sony_playstation2_iso/{}", encoded_fn));
+			const Catalog::Group* grp = Catalog::Manager::GetInstance().FindGroupByGroupKey(entry.groupKey);
+			if (grp)
+			{
+				for (const auto& variant : grp->variants)
+				{
+					if (!variant.downloadUrl.empty() &&
+						Catalog::Parser::IsSupportedFormat(variant.downloadUrl) &&
+						!Catalog::Parser::IsArchiveUrl(variant.downloadUrl))
+					{
+						add_unique(variant.downloadUrl);
+						break;
+					}
+				}
+			}
 		}
 
 		return sources;
@@ -369,6 +390,10 @@ namespace RomDownloader
 			job.statusMessage = job.errorMessage;
 			Catalog::Manager::GetInstance().UpdateDownloadProgress(job.fileName, false, false, 0.0f, 0, 0);
 			Console.Error("RomDownloader: Failed to resolve valid sources for '%s'", job.fileName.c_str());
+			ImGuiFullscreen::ShowToast(
+				ICON_FA_TRIANGLE_EXCLAMATION " Erro no Download",
+				fmt::format("Nenhuma fonte compatível encontrada para '{}'.", job.title),
+				5.0f);
 			return false;
 		}
 
@@ -401,6 +426,12 @@ namespace RomDownloader
 
 		if (download_succeeded)
 		{
+			// If we downloaded a .chd from mirror for an .iso entry, ensure the extension matches
+			if (StringUtil::EndsWithNoCase(job.activeUrl, ".chd") && StringUtil::EndsWithNoCase(job.finalPath, ".iso"))
+			{
+				job.finalPath = Catalog::Parser::StripExtension(job.finalPath) + ".chd";
+			}
+
 			// Atomic rename from .part to final .chd / .iso
 			Error rename_error;
 			if (FileSystem::RenamePath(job.partPath.c_str(), job.finalPath.c_str(), &rename_error))
@@ -415,7 +446,8 @@ namespace RomDownloader
 
 				Host::ReportInfoAsync("Download Concluído",
 					fmt::format("'{}' foi gravado e está disponível na aba Salvos!", job.title));
-				ImGuiFullscreen::ShowToast("Download Concluído",
+				ImGuiFullscreen::ShowToast(
+					ICON_FA_CHECK " Download Concluído",
 					fmt::format("'{}' pronto para jogar!", job.title), 5.0f);
 
 				Console.WriteLn("RomDownloader: Successfully completed and installed '%s'", job.finalPath.c_str());
@@ -427,6 +459,9 @@ namespace RomDownloader
 				job.errorMessage = fmt::format("Falha ao renomear arquivo temporário: {}", rename_error.GetDescription());
 				job.statusMessage = job.errorMessage;
 				Console.Error("RomDownloader: Rename error: %s", job.errorMessage.c_str());
+				ImGuiFullscreen::ShowToast(
+					ICON_FA_TRIANGLE_EXCLAMATION " Erro ao Gravar",
+					job.errorMessage, 5.0f);
 				return false;
 			}
 		}
@@ -444,13 +479,19 @@ namespace RomDownloader
 				job.errorMessage = "Falha ao baixar após esgotar fontes disponíveis.";
 			job.statusMessage = job.errorMessage;
 			Catalog::Manager::GetInstance().UpdateDownloadProgress(job.fileName, false, false, 0.0f, 0, 0);
+			ImGuiFullscreen::ShowToast(
+				ICON_FA_TRIANGLE_EXCLAMATION " Falha no Download",
+				fmt::format("Não foi possível baixar '{}'. Servidores de download indisponíveis.", job.title),
+				6.0f);
 			return false;
 		}
 	}
 
 	bool Manager::PerformStreamingDownload(Job& job, const std::string& sourceUrl)
 	{
-		HINTERNET hSession = WinHttpOpen(L"XBSX2-Downloader/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+		HINTERNET hSession = WinHttpOpen(
+			L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
 			WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 		if (!hSession)
 		{
@@ -461,51 +502,6 @@ namespace RomDownloader
 		// Configure reasonable timeouts
 		WinHttpSetTimeouts(hSession, 15000, 15000, 20000, 20000);
 
-		std::wstring host_name;
-		std::wstring object_path;
-		host_name.resize(sourceUrl.size());
-		object_path.resize(sourceUrl.size());
-
-		URL_COMPONENTSW uc = {};
-		uc.dwStructSize = sizeof(uc);
-		uc.lpszHostName = host_name.data();
-		uc.dwHostNameLength = static_cast<DWORD>(host_name.size());
-		uc.lpszUrlPath = object_path.data();
-		uc.dwUrlPathLength = static_cast<DWORD>(object_path.size());
-
-		const std::wstring url_wide = StringUtil::UTF8StringToWideString(sourceUrl);
-		if (!WinHttpCrackUrl(url_wide.c_str(), static_cast<DWORD>(url_wide.size()), 0, &uc))
-		{
-			WinHttpCloseHandle(hSession);
-			return false;
-		}
-
-		host_name.resize(uc.dwHostNameLength);
-		object_path.resize(uc.dwUrlPathLength);
-		if (uc.dwExtraInfoLength > 0 && uc.lpszExtraInfo)
-			object_path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
-
-		HINTERNET hConnect = WinHttpConnect(hSession, host_name.c_str(), uc.nPort, 0);
-		if (!hConnect)
-		{
-			WinHttpCloseHandle(hSession);
-			return false;
-		}
-
-		DWORD open_flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-		HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", object_path.c_str(), nullptr,
-			WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, open_flags);
-		if (!hRequest)
-		{
-			WinHttpCloseHandle(hConnect);
-			WinHttpCloseHandle(hSession);
-			return false;
-		}
-
-		// Automatically follow HTTP 301, 302, 307 redirects
-		DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-		WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy, sizeof(redirect_policy));
-
 		// Check for existing partial file to resume
 		s64 existing_bytes = 0;
 		if (FileSystem::FileExists(job.partPath.c_str()))
@@ -513,30 +509,123 @@ namespace RomDownloader
 			existing_bytes = FileSystem::GetPathFileSize(job.partPath.c_str());
 		}
 
-		if (existing_bytes > 0)
-		{
-			std::wstring range_hdr = StringUtil::UTF8StringToWideString(fmt::format("Range: bytes={}-", existing_bytes));
-			WinHttpAddRequestHeaders(hRequest, range_hdr.c_str(), static_cast<DWORD>(range_hdr.length()),
-				WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-		}
-
-		if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-			!WinHttpReceiveResponse(hRequest, nullptr))
-		{
-			WinHttpCloseHandle(hRequest);
-			WinHttpCloseHandle(hConnect);
-			WinHttpCloseHandle(hSession);
-			return false;
-		}
-
+		std::string current_url = sourceUrl;
+		HINTERNET hConnect = nullptr;
+		HINTERNET hRequest = nullptr;
 		DWORD status_code = 0;
-		DWORD dwSize = sizeof(status_code);
-		WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-			WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &dwSize, WINHTTP_NO_HEADER_INDEX);
+
+		// Redirect loop supporting up to 10 hops (essential for Hugging Face -> AWS CDN redirects)
+		for (int redirect_count = 0; redirect_count < 10; ++redirect_count)
+		{
+			if (hRequest)
+			{
+				WinHttpCloseHandle(hRequest);
+				hRequest = nullptr;
+			}
+			if (hConnect)
+			{
+				WinHttpCloseHandle(hConnect);
+				hConnect = nullptr;
+			}
+
+			if (m_stop_requested || m_cancel_requested)
+			{
+				WinHttpCloseHandle(hSession);
+				return false;
+			}
+
+			std::wstring host_name;
+			std::wstring object_path;
+			host_name.resize(current_url.size());
+			object_path.resize(current_url.size());
+
+			URL_COMPONENTSW uc = {};
+			uc.dwStructSize = sizeof(uc);
+			uc.lpszHostName = host_name.data();
+			uc.dwHostNameLength = static_cast<DWORD>(host_name.size());
+			uc.lpszUrlPath = object_path.data();
+			uc.dwUrlPathLength = static_cast<DWORD>(object_path.size());
+
+			const std::wstring url_wide = StringUtil::UTF8StringToWideString(current_url);
+			if (!WinHttpCrackUrl(url_wide.c_str(), static_cast<DWORD>(url_wide.size()), 0, &uc))
+			{
+				job.errorMessage = fmt::format("URL de download inválida: {}", current_url);
+				WinHttpCloseHandle(hSession);
+				return false;
+			}
+
+			host_name.resize(uc.dwHostNameLength);
+			object_path.resize(uc.dwUrlPathLength);
+			if (uc.dwExtraInfoLength > 0 && uc.lpszExtraInfo)
+				object_path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+
+			hConnect = WinHttpConnect(hSession, host_name.c_str(), uc.nPort, 0);
+			if (!hConnect)
+			{
+				job.errorMessage = "Falha ao conectar ao servidor de download.";
+				WinHttpCloseHandle(hSession);
+				return false;
+			}
+
+			DWORD open_flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+			hRequest = WinHttpOpenRequest(hConnect, L"GET", object_path.c_str(), nullptr,
+				WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, open_flags);
+			if (!hRequest)
+			{
+				job.errorMessage = "Falha ao criar requisição HTTP.";
+				WinHttpCloseHandle(hConnect);
+				WinHttpCloseHandle(hSession);
+				return false;
+			}
+
+			DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+			WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy, sizeof(redirect_policy));
+
+			if (existing_bytes > 0)
+			{
+				std::wstring range_hdr = StringUtil::UTF8StringToWideString(fmt::format("Range: bytes={}-", existing_bytes));
+				WinHttpAddRequestHeaders(hRequest, range_hdr.c_str(), static_cast<DWORD>(range_hdr.length()),
+					WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+			}
+
+			if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+				!WinHttpReceiveResponse(hRequest, nullptr))
+			{
+				Console.Warning("RomDownloader: WinHttpSendRequest/ReceiveResponse failed (%u)", GetLastError());
+				WinHttpCloseHandle(hRequest);
+				WinHttpCloseHandle(hConnect);
+				WinHttpCloseHandle(hSession);
+				return false;
+			}
+
+			status_code = 0;
+			DWORD dwSize = sizeof(status_code);
+			WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+				WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &dwSize, WINHTTP_NO_HEADER_INDEX);
+
+			// Check for HTTP redirects (301, 302, 303, 307, 308)
+			if (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308)
+			{
+				wchar_t loc_buf[2048] = {};
+				DWORD loc_sz = sizeof(loc_buf);
+				if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, loc_buf, &loc_sz, WINHTTP_NO_HEADER_INDEX))
+				{
+					std::string next_url = StringUtil::WideStringToUTF8String(loc_buf);
+					if (!next_url.empty())
+					{
+						Console.WriteLn("RomDownloader: Following redirect (%u) -> '%s'", status_code, next_url.c_str());
+						current_url = std::move(next_url);
+						continue; // Follow redirect hop
+					}
+				}
+			}
+
+			break; // Not a redirect or redirect followed successfully
+		}
 
 		if (status_code != 200 && status_code != 206)
 		{
-			Console.Warning("RomDownloader: HTTP response code %u for '%s'", status_code, sourceUrl.c_str());
+			Console.Warning("RomDownloader: HTTP response code %u for '%s'", status_code, current_url.c_str());
 			WinHttpCloseHandle(hRequest);
 			WinHttpCloseHandle(hConnect);
 			WinHttpCloseHandle(hSession);
@@ -546,7 +635,7 @@ namespace RomDownloader
 		// Query total file length
 		u64 content_len = 0;
 		wchar_t len_buf[64] = {};
-		dwSize = sizeof(len_buf);
+		DWORD dwSize = sizeof(len_buf);
 		if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
 				len_buf, &dwSize, WINHTTP_NO_HEADER_INDEX))
 		{

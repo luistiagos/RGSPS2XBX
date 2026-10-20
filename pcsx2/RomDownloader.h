@@ -95,6 +95,12 @@ namespace RomDownloader
 		/// Retrieves snapshot of job matching filename.
 		bool GetJob(const std::string_view fileName, Job* out_job) const;
 
+		/// Returns the number of jobs waiting in the download queue.
+		size_t GetQueueCount() const;
+
+		/// Returns a snapshot of queued jobs.
+		std::vector<Job> GetQueueJobs() const;
+
 		/// Automatic pause hook when emulation starts.
 		void OnVMStarting();
 

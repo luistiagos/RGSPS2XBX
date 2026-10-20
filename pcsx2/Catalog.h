@@ -42,6 +42,7 @@ namespace Catalog
 
 		bool IsChd() const;
 		bool IsIso() const;
+		bool HasDirectDownload() const { return !downloadUrl.empty(); }
 		std::string GetPartPath(const std::string& romsDir) const;
 	};
 
@@ -55,6 +56,7 @@ namespace Catalog
 		size_t primaryIndex = 0;      // Index of default/primary variant to display
 
 		bool isDownloaded = false;
+		bool hasDirectDownload = false; // True if any variant has a direct download URL
 		std::string localPath;        // Path to the downloaded variant if any
 
 		const Entry& GetPrimaryEntry() const;
@@ -119,6 +121,9 @@ namespace Catalog
 
 		/// Looks up a group by group key.
 		const Group* FindGroupByGroupKey(const std::string_view groupKey) const;
+
+		/// Returns thread-safe copy of variant filenames for a group key.
+		std::vector<std::string> GetGroupVariantFileNames(const std::string_view groupKey) const;
 
 		/// Fast instant search query matching all space-separated tokens against normalized titles.
 		std::vector<size_t> SearchGroups(const std::string_view query) const;

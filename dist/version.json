@@ -1,0 +1,32 @@
+{
+    "product":  "XBSX2",
+    "versionName":  "2.0.9.1",
+    "channel":  "release",
+    "updatedAt":  "2026-10-20T00:21:41Z",
+    "downloads":  {
+                      "series":  {
+                                     "name":  "xbsx2-series.msixbundle",
+                                     "platform":  "Xbox Series S|X",
+                                     "arch":  "x64-avx2",
+                                     "url":  "https://versions.digitalstoregames.com/rgs/xbsx2/xbsx2-series.msixbundle?v=2.0.9.1",
+                                     "sha256":  "3a03a4ccc99d5eaad56ced084bea45be038fa18a6ff054d786f2071c56f7f946",
+                                     "size":  24995674
+                                 },
+                      "default":  {
+                                      "name":  "xbsx2.msixbundle",
+                                      "platform":  "Xbox Series (Padrao)",
+                                      "arch":  "x64-avx2",
+                                      "url":  "https://versions.digitalstoregames.com/rgs/xbsx2/xbsx2.msixbundle?v=2.0.9.1",
+                                      "sha256":  "3a03a4ccc99d5eaad56ced084bea45be038fa18a6ff054d786f2071c56f7f946",
+                                      "size":  24995674
+                                  },
+                      "one":  {
+                                  "name":  "xbsx2-one.msixbundle",
+                                  "platform":  "Xbox One (Fat/S/X)",
+                                  "arch":  "x64-sse4",
+                                  "url":  "https://versions.digitalstoregames.com/rgs/xbsx2/xbsx2-one.msixbundle?v=2.0.9.1",
+                                  "sha256":  "0e1162082385bea2e2482d22e48443d6bd18e22d4d57d0abecc2b569bd083dd9",
+                                  "size":  24998090
+                              }
+                  }
+}
