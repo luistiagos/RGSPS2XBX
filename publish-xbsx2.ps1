@@ -122,6 +122,29 @@ function Print-Step {
     Write-Host "========================================" -ForegroundColor $Color
 }
 
+# Chaves do R2 no AMBIENTE do rclone, nunca na linha de comando: a linha de comando de um processo e
+# legivel por qualquer processo do usuario (Gerenciador de Tarefas, Win32_Process.CommandLine) e
+# ferramentas de diagnostico a gravam em log (foi assim que as chaves vazaram em 2026-11-10). Durante a
+# chamada saem as RCLONE_* herdadas: em DEBUG o rclone imprime o valor que leu do ambiente. No fim tudo
+# volta ao que era, para a chave nao ficar no PowerShell de quem rodou o script.
+# Uso: Invoke-R2Rclone $rclone $cfg <argumentos do rclone, sem as chaves>
+function Invoke-R2Rclone {
+    $exe = $args[0]
+    $r2 = $args[1]
+    $rcloneArgs = @($args | Select-Object -Skip 2)
+    $herdadas = @(Get-ChildItem Env: | Where-Object { $_.Name -like 'RCLONE_*' } |
+        ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Value = $_.Value } })
+    foreach ($v in $herdadas) { Remove-Item -LiteralPath "Env:$($v.Name)" }
+    try {
+        $env:RCLONE_S3_ACCESS_KEY_ID = $r2.accessKeyId
+        $env:RCLONE_S3_SECRET_ACCESS_KEY = $r2.secretAccessKey
+        & $exe @rcloneArgs
+    } finally {
+        Remove-Item -LiteralPath Env:RCLONE_S3_ACCESS_KEY_ID, Env:RCLONE_S3_SECRET_ACCESS_KEY -ErrorAction SilentlyContinue
+        foreach ($v in $herdadas) { Set-Item -LiteralPath "Env:$($v.Name)" -Value $v.Value }
+    }
+}
+
 function Find-Rclone {
     $cmd = Get-Command rclone -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -219,15 +242,34 @@ $seriesBundle = Join-Path $seriesPkgDir "pcsx2-uwp_${VersionName}_x64_Release AV
 $onePkgDir    = Join-Path $PROJECT_ROOT "AppPackages\pcsx2-uwp\pcsx2-uwp_${VersionName}_Test"
 $oneBundle    = Join-Path $onePkgDir "pcsx2-uwp_${VersionName}_x64.msixbundle"
 
+function Clear-UwpIntermediatePackaging {
+    param([string]$ProjectRoot)
+    $items = @(
+        (Join-Path $ProjectRoot "bin\AppxManifest.xml"),
+        (Join-Path $ProjectRoot "bin\ForBundle"),
+        (Join-Path $ProjectRoot "bin\pcsx2-uwp.build.appxrecipe"),
+        (Join-Path $ProjectRoot "pcsx2-uwp\BundleArtifacts")
+    )
+    foreach ($item in $items) {
+        if (Test-Path -LiteralPath $item) {
+            Remove-Item -LiteralPath $item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Get-ChildItem -Path (Join-Path $ProjectRoot "bin") -Filter "*.msix" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path (Join-Path $ProjectRoot "bin") -Filter "*.appx" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 if (-not $SkipBuild) {
     if ($Target -eq 'All' -or $Target -eq 'Series') {
         Print-Step "PASSO 1/8: Compilando Xbox Series S|X (Release AVX2)"
+        Clear-UwpIntermediatePackaging -ProjectRoot $PROJECT_ROOT
         & $msbuild $VCXPROJ_PATH "/p:SolutionDir=$PROJECT_ROOT\\" /p:Configuration="Release AVX2" /p:Platform=x64 /p:AppxPackageSigningEnabled=true "/p:PackageCertificateKeyFile=$KEY_PATH" /m:8
         if ($LASTEXITCODE -ne 0) { throw "Falha na compilacao do perfil Release AVX2 (exit code $LASTEXITCODE)" }
     }
 
     if ($Target -eq 'All' -or $Target -eq 'One') {
         Print-Step "PASSO 1/8: Compilando Xbox One (Release SSE4)"
+        Clear-UwpIntermediatePackaging -ProjectRoot $PROJECT_ROOT
         & $msbuild $VCXPROJ_PATH "/p:SolutionDir=$PROJECT_ROOT\\" /p:Configuration="Release" /p:Platform=x64 /p:AppxPackageSigningEnabled=true "/p:PackageCertificateKeyFile=$KEY_PATH" /m:8
         if ($LASTEXITCODE -ne 0) { throw "Falha na compilacao do perfil Release (exit code $LASTEXITCODE)" }
     }
@@ -336,8 +378,6 @@ $rclone  = Find-Rclone
 $s3Flags = @(
     "--log-level=ERROR",
     "--s3-provider=Cloudflare",
-    "--s3-access-key-id=$($cfg.accessKeyId)",
-    "--s3-secret-access-key=$($cfg.secretAccessKey)",
     "--s3-endpoint=$($cfg.endpoint)",
     "--s3-no-check-bucket"
 )
@@ -352,7 +392,7 @@ $historyDest = ":s3:$($cfg.bucket)/$R2_HISTORY"
 if (-not $SkipHistory) {
     Print-Step "PASSO 3/8: Upload Historico Versionado ($R2_HISTORY)"
 
-    $existingHistory = & $rclone lsjson $historyDest @s3Flags --hash | ConvertFrom-Json
+    $existingHistory = Invoke-R2Rclone $rclone $cfg lsjson $historyDest @s3Flags --hash | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw "rclone lsjson falhou em $historyDest" }
 
     foreach ($item in $itemsToPublish) {
@@ -375,7 +415,7 @@ if (-not $SkipHistory) {
         if ($DryRun) {
             Write-Host "  [DRY-RUN] envio pulado." -ForegroundColor Magenta
         } else {
-            & $rclone copyto $item.LocalPath "$historyDest/$histName" @s3Flags @bundleHeaders --progress
+            Invoke-R2Rclone $rclone $cfg copyto $item.LocalPath "$historyDest/$histName" @s3Flags @bundleHeaders --progress
             if ($LASTEXITCODE -ne 0) { throw "rclone copyto falhou ao enviar $histName" }
             Write-Host "  OK: $histName enviado" -ForegroundColor Green
         }
@@ -414,10 +454,10 @@ foreach ($item in $itemsToPublish) {
     if ($DryRun) {
         Write-Host "  [DRY-RUN] envio pulado." -ForegroundColor Magenta
     } else {
-        & $rclone copyto $item.LocalPath "$distDest/$($item.FileName)" @s3Flags @bundleHeaders --progress
+        Invoke-R2Rclone $rclone $cfg copyto $item.LocalPath "$distDest/$($item.FileName)" @s3Flags @bundleHeaders --progress
         if ($LASTEXITCODE -ne 0) { throw "rclone copyto falhou para $($item.FileName)" }
 
-        & $rclone copyto $item.Sha256File "$distDest/$($item.FileName).sha256" @s3Flags @txtHeaders
+        Invoke-R2Rclone $rclone $cfg copyto $item.Sha256File "$distDest/$($item.FileName).sha256" @s3Flags @txtHeaders
         if ($LASTEXITCODE -ne 0) { throw "rclone copyto falhou para $($item.FileName).sha256" }
 
         Write-Host "  OK: $($item.FileName) e sidecar publicados" -ForegroundColor Green
@@ -430,7 +470,7 @@ Print-Step "PASSO 5/8: Verificacao Pos-Upload (Origem R2)"
 if ($DryRun) {
     Write-Host "  [DRY-RUN] verificacao pulada." -ForegroundColor Magenta
 } else {
-    $remoteEntries = & $rclone lsjson $distDest @s3Flags --hash | ConvertFrom-Json
+    $remoteEntries = Invoke-R2Rclone $rclone $cfg lsjson $distDest @s3Flags --hash | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw "rclone lsjson falhou em $distDest" }
 
     foreach ($item in $itemsToPublish) {
@@ -449,7 +489,7 @@ Print-Step "PASSO 6/8: Publicando Manifesto de Versao (version.json)"
 if ($DryRun) {
     Write-Host "  [DRY-RUN] envio pulado." -ForegroundColor Magenta
 } else {
-    & $rclone copyto $versionJsonFile "$distDest/version.json" @s3Flags @jsonHeaders
+    Invoke-R2Rclone $rclone $cfg copyto $versionJsonFile "$distDest/version.json" @s3Flags @jsonHeaders
     if ($LASTEXITCODE -ne 0) { throw "rclone copyto falhou para version.json" }
     Write-Host "  OK: version.json publicado com sucesso" -ForegroundColor Green
 }
