@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
 
       # actions/checkout elides tags, fetch them primarily for releases
       - name: Fetch Tags
@@ -83,10 +83,10 @@ jobs:
         run: ./.github/workflows/scripts/common/name-artifacts.sh
 
       - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Setup NuGet
-        uses: NuGet/setup-nuget@v2.0.1
+        uses: NuGet/setup-nuget@v3.1.0
 
       - name: Download Patches
         shell: cmd
@@ -96,7 +96,7 @@ jobs:
 
       - name: Cache Dependencies
         id: cache-deps
-        uses: actions/cache@v5.0.3
+        uses: actions/cache@v6.1.0
         with:
           path: deps
           key: ${{ inputs.os }} ${{ inputs.platform }} deps ${{ hashFiles('.github/workflows/scripts/uwp/build-dependencies-uwp.bat', '.github/workflows/scripts/common/*.patch') }}
@@ -116,7 +116,7 @@ jobs:
           msbuild "PCSX2_qt.sln" /m /v:m /p:PlatformToolset=v145 /p:Configuration="${{ inputs.configuration }}" /p:Platform="${{ inputs.platform }}" /t:restore,build /p:RestorePackagesConfig=true
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.artifact-metadata.outputs.artifact-name }}
           path: |
@@ -130,7 +130,7 @@ jobs:
             !./AppPackages/**/*.lib
 
       - name: Install the Breakpad Symbol Generator
-        uses: baptiste0928/cargo-install@b687c656bda5733207e629b50a22bf68974a0305
+        uses: baptiste0928/cargo-install@8195d4f734a149db85385bb4102b42efcd373759
         with:
           crate: dump_syms
 
@@ -148,7 +148,7 @@ jobs:
           }
 
       - name: Upload Artifact - with Symbols
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.artifact-metadata.outputs.artifact-name }}-symbols
           path: |
